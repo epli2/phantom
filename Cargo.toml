@@ -4,6 +4,7 @@ members = [
     "crates/phantom-storage",
     "crates/phantom-capture",
     "crates/phantom-tui",
+    "crates/phantom-agent",
 ]
 resolver = "3"
 

@@ -1,0 +1,64 @@
+services:
+  # ── LD_PRELOAD backend test ─────────────────────────────────────────────────
+  # Runs phantom with the Linux LD_PRELOAD agent, tracing a curl request.
+  #
+  # Usage:
+  #   docker compose run --rm test-ldpreload
+  #
+  # Flow:
+  #   1. phantom starts and binds a Unix datagram socket
+  #   2. curl is spawned with LD_PRELOAD=libphantom_agent.so
+  #   3. The agent intercepts HTTP send/recv and sends the trace over the socket
+  #   4. phantom displays the captured trace in the TUI
+  #   5. Press 'q' (or Ctrl-C) to exit
+  #
+  test-ldpreload:
+    build: .
+    image: phantom-dev:latest
+    tty: true
+    stdin_open: true
+    command:
+      - --backend
+      - ldpreload
+      - --agent-lib
+      - /usr/local/lib/libphantom_agent.so
+      - --
+      - curl
+      - -s
+      - http://httpbin.org/get
+
+  # ── MITM proxy backend test ─────────────────────────────────────────────────
+  # Runs phantom as an HTTP/HTTPS proxy on port 8080.
+  #
+  # Usage:
+  #   docker compose run --rm -p 8080:8080 test-proxy
+  #
+  # Then from your Mac terminal:
+  #   curl -x http://127.0.0.1:8080 http://httpbin.org/get
+  #
+  test-proxy:
+    build: .
+    image: phantom-dev:latest
+    tty: true
+    stdin_open: true
+    ports:
+      - "8080:8080"
+    command:
+      - --backend
+      - proxy
+      - --port
+      - "8080"
+
+  # ── Custom / interactive shell ──────────────────────────────────────────────
+  # Drop into a bash shell inside the runtime image for manual testing.
+  #
+  # Usage:
+  #   docker compose run --rm shell
+  #   > LD_PRELOAD=/usr/local/lib/libphantom_agent.so PHANTOM_SOCKET=/tmp/t.sock curl http://example.com
+  #
+  shell:
+    build: .
+    image: phantom-dev:latest
+    tty: true
+    stdin_open: true
+    entrypoint: /bin/bash

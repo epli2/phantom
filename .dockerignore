@@ -1,0 +1,25 @@
+# Build artifacts — large and regenerated inside the container
+target/
+
+# Version control
+.git/
+.gitignore
+
+# Claude project files
+.claude/
+
+# Documentation (optional — remove if you want docs in the image)
+*.md
+plan.md
+
+# OS / editor noise
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.log
