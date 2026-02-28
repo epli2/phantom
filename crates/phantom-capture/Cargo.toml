@@ -1,0 +1,15 @@
+[package]
+name = "phantom-capture"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+phantom-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+hudsucker = { version = "0.22", features = ["rcgen-ca"] }
+hyper = "1"
+http = "1"
+rand = "0.8"
+bytes = "1"
+http-body-util = "0.1"
