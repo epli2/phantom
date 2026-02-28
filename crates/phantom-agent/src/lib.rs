@@ -461,12 +461,14 @@ redhook::hook! {
         len:    size_t,
         flags:  c_int
     ) -> ssize_t => phantom_send {
-        let result = redhook::real!(send)(sockfd, buf, len, flags);
+        // SAFETY: delegating to the real libc send(2).
+        let result = unsafe { redhook::real!(send)(sockfd, buf, len, flags) };
         if result > 0 {
             IN_HOOK.with(|g| {
                 if !g.get() {
                     g.set(true);
-                    let data = std::slice::from_raw_parts(buf as *const u8, result as usize);
+                    // SAFETY: buf points to `result` readable bytes (guaranteed by send contract).
+                    let data = unsafe { std::slice::from_raw_parts(buf as *const u8, result as usize) };
                     process_send(sockfd, data);
                     g.set(false);
                 }
@@ -483,12 +485,14 @@ redhook::hook! {
         len:    size_t,
         flags:  c_int
     ) -> ssize_t => phantom_recv {
-        let result = redhook::real!(recv)(sockfd, buf, len, flags);
+        // SAFETY: delegating to the real libc recv(2).
+        let result = unsafe { redhook::real!(recv)(sockfd, buf, len, flags) };
         if result > 0 {
             IN_HOOK.with(|g| {
                 if !g.get() {
                     g.set(true);
-                    let data = std::slice::from_raw_parts(buf as *const u8, result as usize);
+                    // SAFETY: buf holds `result` initialised bytes written by recv(2).
+                    let data = unsafe { std::slice::from_raw_parts(buf as *const u8, result as usize) };
                     process_recv(sockfd, data);
                     g.set(false);
                 }
@@ -500,7 +504,8 @@ redhook::hook! {
 
 redhook::hook! {
     unsafe fn close(fd: c_int) -> c_int => phantom_close {
-        let result = redhook::real!(close)(fd);
+        // SAFETY: delegating to the real libc close(2).
+        let result = unsafe { redhook::real!(close)(fd) };
         IN_HOOK.with(|g| {
             if !g.get() {
                 g.set(true);
