@@ -1,8 +1,8 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
-use ratatui::Frame;
 
 use crate::app::{App, Pane};
 
@@ -11,7 +11,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // Status bar
-            Constraint::Min(0),   // Main area
+            Constraint::Min(0),    // Main area
             Constraint::Length(1), // Help bar
         ])
         .split(frame.area());
@@ -23,7 +23,12 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let status = Line::from(vec![
-        Span::styled(" phantom", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " phantom",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" v0.1.0 | "),
         Span::styled(
             format!("Traces: {}", app.trace_count),
@@ -82,7 +87,11 @@ fn render_trace_list(frame: &mut Frame, app: &App, area: Rect) {
         Cell::from("Status"),
         Cell::from("Duration"),
     ])
-    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let rows: Vec<Row> = filtered
         .iter()
@@ -103,7 +112,9 @@ fn render_trace_list(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             let style = if i == app.selected_index {
-                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -171,11 +182,19 @@ fn render_trace_detail(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
     // Request section
+    lines.push(Line::from(vec![Span::styled(
+        "Request",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]));
     lines.push(Line::from(vec![
-        Span::styled("Request", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(trace.method.to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            trace.method.to_string(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
         Span::raw(&trace.url),
     ]));
@@ -200,9 +219,10 @@ fn render_trace_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("━".repeat(40), Style::default().fg(Color::DarkGray)),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "━".repeat(40),
+        Style::default().fg(Color::DarkGray),
+    )]));
     lines.push(Line::from(""));
 
     // Response section
@@ -214,11 +234,18 @@ fn render_trace_detail(frame: &mut Frame, app: &App, area: Rect) {
         _ => Color::White,
     };
     lines.push(Line::from(vec![
-        Span::styled("Response", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Response",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" ("),
         Span::styled(
             trace.status_code.to_string(),
-            Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(", {:.0?})", trace.duration)),
     ]));
@@ -279,9 +306,7 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn format_time(ts: &std::time::SystemTime) -> String {
-    let duration = ts
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let duration = ts.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let secs = duration.as_secs();
     let hours = (secs / 3600) % 24;
     let minutes = (secs / 60) % 60;
@@ -313,16 +338,16 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 fn append_body_lines(lines: &mut Vec<Line>, body: &[u8]) {
     if let Ok(text) = std::str::from_utf8(body) {
         // Try pretty-printing JSON
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-            if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-                for line in pretty.lines().take(30) {
-                    lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(Color::White),
-                    )));
-                }
-                return;
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text)
+            && let Ok(pretty) = serde_json::to_string_pretty(&json)
+        {
+            for line in pretty.lines().take(30) {
+                lines.push(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::White),
+                )));
             }
+            return;
         }
         // Plain text
         for line in text.lines().take(30) {

@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{execute, event::KeyEventKind};
+use crossterm::{event::KeyEventKind, execute};
 use phantom_core::storage::TraceStore;
 use phantom_core::trace::HttpTrace;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use crate::app::App;

@@ -20,10 +20,10 @@ impl EventHandler {
 
     /// Poll for the next event. Returns `None` if no event within tick rate.
     pub fn poll(&self) -> std::io::Result<Event> {
-        if event::poll(self.tick_rate)? {
-            if let CrosstermEvent::Key(key) = event::read()? {
-                return Ok(Event::Key(key));
-            }
+        if event::poll(self.tick_rate)?
+            && let CrosstermEvent::Key(key) = event::read()?
+        {
+            return Ok(Event::Key(key));
         }
         Ok(Event::Tick)
     }

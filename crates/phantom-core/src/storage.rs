@@ -16,11 +16,7 @@ pub trait TraceStore: Send + Sync {
     fn get_by_trace_id(&self, trace_id: &TraceId) -> Result<Vec<HttpTrace>, StorageError>;
 
     /// Search traces by URL substring.
-    fn search_by_url(
-        &self,
-        pattern: &str,
-        limit: usize,
-    ) -> Result<Vec<HttpTrace>, StorageError>;
+    fn search_by_url(&self, pattern: &str, limit: usize) -> Result<Vec<HttpTrace>, StorageError>;
 
     /// Get total trace count.
     fn count(&self) -> Result<u64, StorageError>;

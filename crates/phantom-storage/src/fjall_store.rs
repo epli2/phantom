@@ -95,8 +95,8 @@ impl TraceStore for FjallTraceStore {
         else {
             return Ok(None);
         };
-        let trace: HttpTrace =
-            serde_json::from_slice(&value).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let trace: HttpTrace = serde_json::from_slice(&value)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
         Ok(Some(trace))
     }
 
@@ -145,10 +145,10 @@ impl TraceStore for FjallTraceStore {
             let span_id_bytes: [u8; 8] = value[..8]
                 .try_into()
                 .map_err(|_| StorageError::Read("invalid span_id in index".into()))?;
-            if let Some(trace) = self.get_by_span_id(&SpanId(span_id_bytes))? {
-                if trace.url.contains(pattern) {
-                    results.push(trace);
-                }
+            if let Some(trace) = self.get_by_span_id(&SpanId(span_id_bytes))?
+                && trace.url.contains(pattern)
+            {
+                results.push(trace);
             }
         }
         Ok(results)
@@ -252,9 +252,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FjallTraceStore::open(dir.path()).unwrap();
 
-        store.insert(&make_trace("http://example.com/api/users", 200)).unwrap();
-        store.insert(&make_trace("http://example.com/api/orders", 201)).unwrap();
-        store.insert(&make_trace("http://example.com/health", 200)).unwrap();
+        store
+            .insert(&make_trace("http://example.com/api/users", 200))
+            .unwrap();
+        store
+            .insert(&make_trace("http://example.com/api/orders", 201))
+            .unwrap();
+        store
+            .insert(&make_trace("http://example.com/health", 200))
+            .unwrap();
 
         let results = store.search_by_url("/api/", 10).unwrap();
         assert_eq!(results.len(), 2);

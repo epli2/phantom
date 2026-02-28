@@ -130,11 +130,7 @@ struct PendingRequest {
 }
 
 impl HttpHandler for TraceHandler {
-    async fn handle_request(
-        &mut self,
-        ctx: &HttpContext,
-        req: Request<Body>,
-    ) -> RequestOrResponse {
+    async fn handle_request(&mut self, ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
         let method = parse_method(req.method());
         let url = reconstruct_url(&req);
         let version = format!("{:?}", req.version());
@@ -160,11 +156,7 @@ impl HttpHandler for TraceHandler {
         RequestOrResponse::Request(rebuilt)
     }
 
-    async fn handle_response(
-        &mut self,
-        _ctx: &HttpContext,
-        res: Response<Body>,
-    ) -> Response<Body> {
+    async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
         let (parts, body) = res.into_parts();
         let response_headers = extract_headers(&parts.headers);
         let status_code = parts.status.as_u16();
