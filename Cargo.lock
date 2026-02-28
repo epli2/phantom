@@ -1571,6 +1571,8 @@ dependencies = [
  "phantom-core",
  "phantom-storage",
  "phantom-tui",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

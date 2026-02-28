@@ -49,6 +49,31 @@ services:
       - --port
       - "8080"
 
+  # ── LD_PRELOAD backend — JSONL output (non-interactive) ────────────────────
+  # Like test-ldpreload but outputs JSON Lines to stdout instead of the TUI.
+  # Ideal for scripting, CI, or AI-driven workflows.
+  #
+  # Usage:
+  #   docker compose run --rm test-jsonl
+  #   docker compose run --rm test-jsonl | jq .
+  #
+  # The process exits automatically when the traced command finishes.
+  #
+  test-jsonl:
+    build: .
+    image: phantom-dev:latest
+    command:
+      - --backend
+      - ldpreload
+      - --output
+      - jsonl
+      - --agent-lib
+      - /usr/local/lib/libphantom_agent.so
+      - --
+      - curl
+      - -s
+      - http://httpbin.org/get
+
   # ── Custom / interactive shell ──────────────────────────────────────────────
   # Drop into a bash shell inside the runtime image for manual testing.
   #
