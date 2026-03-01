@@ -179,6 +179,105 @@ PYEOF
     # Temp file is intentionally left; the OS cleans /tmp on reboot.
 }
 
+# Start a one-shot HTTP/2 over HTTPS (TLS + ALPN h2) mock server using Python 3.
+# Identical frame logic to start_mock_h2c, but wrapped in TLS with ALPN "h2"
+# so that curl --http2 negotiates HTTP/2 via ALPN rather than prior-knowledge.
+# Returns the server PID.
+#
+# Usage: start_mock_h2tls PORT CERT_FILE KEY_FILE RESPONSE_BODY
+start_mock_h2tls() {
+    local port="$1"
+    local cert="$2"
+    local key="$3"
+    local body="$4"
+    local srv
+    srv=$(mktemp /tmp/h2tls_XXXX.py)
+    cat > "$srv" << 'PYEOF'
+import socket, ssl, struct, sys, time
+
+PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+
+def mk(t, f, s, p=b''):
+    n = len(p)
+    return bytes([n >> 16 & 0xff, n >> 8 & 0xff, n & 0xff, t, f]) \
+         + struct.pack('!I', s & 0x7fffffff) + p
+
+port = int(sys.argv[1])
+cert = sys.argv[2]
+key  = sys.argv[3]
+body = (sys.argv[4] if len(sys.argv) > 4 else '{}').encode()
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(cert, key)
+ctx.set_alpn_protocols(['h2'])
+
+raw = socket.socket()
+raw.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+raw.bind(('127.0.0.1', port))
+raw.listen(1)
+raw.settimeout(5)
+raw_conn, _ = raw.accept()
+try:
+    conn = ctx.wrap_socket(raw_conn, server_side=True)
+except ssl.SSLError:
+    sys.exit(1)
+conn.settimeout(3)
+
+buf = b''
+while len(buf) < len(PREFACE):
+    try:
+        buf += conn.recv(4096)
+    except OSError:
+        break
+
+buf = buf[len(PREFACE):]
+conn.sendall(mk(0x4, 0, 0))  # server SETTINGS
+
+replied = set()
+for _ in range(500):
+    if len(buf) >= 9:
+        n = (buf[0] << 16) | (buf[1] << 8) | buf[2]
+        t, f = buf[3], buf[4]
+        s = struct.unpack('!I', buf[5:9])[0] & 0x7fffffff
+        if len(buf) >= 9 + n:
+            buf = buf[9 + n:]
+            if t == 0x4 and not (f & 0x1):
+                conn.sendall(mk(0x4, 0x1, 0))
+            elif t == 0x1 and s > 0 and s not in replied:
+                if f & 0x1:
+                    conn.sendall(mk(0x1, 0x4, s, b'\x88'))
+                    conn.sendall(mk(0x0, 0x1, s, body))
+                    replied.add(s)
+            elif t == 0x0 and s > 0 and (f & 0x1) and s not in replied:
+                conn.sendall(mk(0x1, 0x4, s, b'\x88'))
+                conn.sendall(mk(0x0, 0x1, s, body))
+                replied.add(s)
+            continue
+    if replied:
+        break
+    try:
+        chunk = conn.recv(4096)
+        if chunk:
+            buf += chunk
+        else:
+            break
+    except OSError:
+        break
+
+time.sleep(0.2)
+try:
+    conn.close()
+except OSError:
+    pass
+try:
+    raw.close()
+except OSError:
+    pass
+PYEOF
+    python3 "$srv" "$port" "$cert" "$key" "$body" >/dev/null 2>&1 &
+    echo $!
+}
+
 # ── Phantom runner ───────────────────────────────────────────────────────────
 
 # Run phantom in JSONL+ldpreload mode, executing the given command.

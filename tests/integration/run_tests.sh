@@ -404,6 +404,43 @@ test_h2c_post_body() {
 }
 run_test "HTTP/2 cleartext POST" test_h2c_post_body
 
+# ── Test 13: HTTP/2 over HTTPS (TLS + ALPN h2) ──────────────────────────────
+#
+# Uses curl --http2 (no --http2-prior-knowledge) against an HTTPS server that
+# advertises "h2" via ALPN. After the TLS handshake the agent intercepts the
+# plaintext HTTP/2 frames through its SSL_write()/SSL_read() hooks, exercising
+# the same code path used when tracing real-world HTTPS/2 applications.
+
+test_h2_https_get() {
+    if ! curl --version 2>&1 | grep -q 'HTTP2'; then
+        echo "  SKIP: curl lacks HTTP/2 support"
+        return 0
+    fi
+
+    local port=18095
+    local body='{"h2tls":true}'
+
+    local pid
+    pid=$(start_mock_h2tls "$port" "$CERT_DIR/cert.pem" "$CERT_DIR/key.pem" "$body")
+    sleep 0.5
+
+    local output
+    output=$(run_phantom_capture "curl -sk --http2 https://127.0.0.1:$port/h2tls")
+
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+
+    [ -n "$output" ] || { echo "  FAIL: no output"; return 1; }
+
+    local line
+    line=$(echo "$output" | head -1)
+    assert_json_field          "$line" '.protocol_version'      'HTTP/2'  &&
+    assert_json_field          "$line" '.method'                'GET'     &&
+    assert_json_field          "$line" '.status_code'           '200'     &&
+    assert_json_field_contains "$line" '.url'                   '/h2tls'  &&
+    assert_json_field_contains "$line" '.response_body'         'h2tls'
+}
+run_test "HTTP/2 HTTPS (ALPN)" test_h2_https_get
+
 # ── Results ──────────────────────────────────────────────────────────────────
 
 report_results
