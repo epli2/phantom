@@ -4,8 +4,6 @@
 //! by the phantom-agent dylib injected into a target process, and converts
 //! them into [`HttpTrace`] objects.
 
-#![cfg(target_os = "linux")]
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
