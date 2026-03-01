@@ -334,6 +334,76 @@ test_https_post_body() {
 }
 run_test "HTTPS POST with body" test_https_post_body
 
+# ── Test 11: HTTP/2 cleartext GET ───────────────────────────────────────────
+#
+# Uses curl --http2-prior-knowledge (h2c) to send a plain-TCP HTTP/2 request.
+# The agent should detect the HTTP/2 client preface, parse the binary frames,
+# and emit a trace with protocol_version="HTTP/2".
+
+test_h2c_get_200() {
+    # Require curl with HTTP/2 support.
+    if ! curl --version 2>&1 | grep -q 'HTTP2'; then
+        echo "  SKIP: curl lacks HTTP/2 support"
+        return 0
+    fi
+
+    local port=18093
+    local body='{"h2":true}'
+
+    local pid
+    pid=$(start_mock_h2c "$port" "$body")
+    sleep 0.2
+
+    local output
+    output=$(run_phantom_capture "curl -s --http2-prior-knowledge http://127.0.0.1:$port/h2test")
+
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+
+    [ -n "$output" ] || { echo "  FAIL: no output"; return 1; }
+
+    local line
+    line=$(echo "$output" | head -1)
+    assert_json_field         "$line" '.protocol_version'       'HTTP/2'      &&
+    assert_json_field         "$line" '.method'                 'GET'         &&
+    assert_json_field         "$line" '.status_code'            '200'         &&
+    assert_json_field_contains "$line" '.url'                   '/h2test'     &&
+    assert_json_field_contains "$line" '.response_body'         'h2'
+}
+run_test "HTTP/2 cleartext GET" test_h2c_get_200
+
+# ── Test 12: HTTP/2 cleartext POST with body ─────────────────────────────────
+
+test_h2c_post_body() {
+    if ! curl --version 2>&1 | grep -q 'HTTP2'; then
+        echo "  SKIP: curl lacks HTTP/2 support"
+        return 0
+    fi
+
+    local port=18094
+    local body='{"posted":true}'
+
+    local pid
+    pid=$(start_mock_h2c "$port" "$body")
+    sleep 0.2
+
+    local output
+    output=$(run_phantom_capture "curl -s --http2-prior-knowledge -X POST -d {\"key\":\"val\"} http://127.0.0.1:$port/h2post")
+
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+
+    [ -n "$output" ] || { echo "  FAIL: no output"; return 1; }
+
+    local line
+    line=$(echo "$output" | head -1)
+    assert_json_field         "$line" '.protocol_version'       'HTTP/2'      &&
+    assert_json_field         "$line" '.method'                 'POST'        &&
+    assert_json_field         "$line" '.status_code'            '200'         &&
+    assert_json_field_contains "$line" '.url'                   '/h2post'     &&
+    assert_json_field_contains "$line" '.request_body'          'key'         &&
+    assert_json_field_contains "$line" '.response_body'         'posted'
+}
+run_test "HTTP/2 cleartext POST" test_h2c_post_body
+
 # ── Results ──────────────────────────────────────────────────────────────────
 
 report_results

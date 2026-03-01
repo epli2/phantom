@@ -88,6 +88,97 @@ start_mock_https() {
     echo $!
 }
 
+# Start a one-shot HTTP/2 cleartext (h2c) mock server using Python 3.
+# Reads the client connection preface, negotiates a SETTINGS exchange, then
+# replies to every request with a fixed response body.
+# Returns the server PID.
+#
+# Usage: start_mock_h2c PORT RESPONSE_BODY
+start_mock_h2c() {
+    local port="$1"
+    local body="$2"
+    local srv
+    srv=$(mktemp /tmp/h2c_XXXX.py)
+    # Write a minimal, stdlib-only HTTP/2 h2c server.
+    # Frame format: 3-byte length | 1-byte type | 1-byte flags | 4-byte stream-id | payload
+    # HPACK byte 0x88 = indexed representation of static-table entry 8 (:status: 200).
+    cat > "$srv" << 'PYEOF'
+import socket, struct, sys, time
+
+PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+
+def mk(t, f, s, p=b''):
+    n = len(p)
+    return bytes([n >> 16 & 0xff, n >> 8 & 0xff, n & 0xff, t, f]) \
+         + struct.pack('!I', s & 0x7fffffff) + p
+
+port = int(sys.argv[1])
+body = (sys.argv[2] if len(sys.argv) > 2 else '{}').encode()
+
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', port))
+srv.listen(1)
+srv.settimeout(5)
+conn, _ = srv.accept()
+conn.settimeout(3)
+
+buf = b''
+while len(buf) < len(PREFACE):
+    try:
+        buf += conn.recv(4096)
+    except OSError:
+        break
+
+buf = buf[len(PREFACE):]
+conn.sendall(mk(0x4, 0, 0))  # server SETTINGS
+
+replied = set()
+for _ in range(500):
+    if len(buf) >= 9:
+        n = (buf[0] << 16) | (buf[1] << 8) | buf[2]
+        t, f = buf[3], buf[4]
+        s = struct.unpack('!I', buf[5:9])[0] & 0x7fffffff
+        if len(buf) >= 9 + n:
+            buf = buf[9 + n:]
+            if t == 0x4 and not (f & 0x1):          # SETTINGS → ACK
+                conn.sendall(mk(0x4, 0x1, 0))
+            elif t == 0x1 and s > 0 and s not in replied:  # HEADERS
+                if f & 0x1:                          # END_STREAM (GET/HEAD)
+                    conn.sendall(mk(0x1, 0x4, s, b'\x88'))
+                    conn.sendall(mk(0x0, 0x1, s, body))
+                    replied.add(s)
+            elif t == 0x0 and s > 0 and (f & 0x1) and s not in replied:  # DATA END_STREAM (POST)
+                conn.sendall(mk(0x1, 0x4, s, b'\x88'))
+                conn.sendall(mk(0x0, 0x1, s, body))
+                replied.add(s)
+            continue
+    if replied:
+        break
+    try:
+        chunk = conn.recv(4096)
+        if chunk:
+            buf += chunk
+        else:
+            break
+    except OSError:
+        break
+
+time.sleep(0.2)
+try:
+    conn.close()
+except OSError:
+    pass
+try:
+    srv.close()
+except OSError:
+    pass
+PYEOF
+    python3 "$srv" "$port" "$body" >/dev/null 2>&1 &
+    echo $!
+    # Temp file is intentionally left; the OS cleans /tmp on reboot.
+}
+
 # ── Phantom runner ───────────────────────────────────────────────────────────
 
 # Run phantom in JSONL+ldpreload mode, executing the given command.
