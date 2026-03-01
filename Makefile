@@ -50,12 +50,17 @@ fmt-fix:
 clippy:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+## Run Clippy for Linux (checks phantom-agent which is Linux-only)
+clippy-linux:
+	rustup target add x86_64-unknown-linux-gnu
+	cargo clippy -p phantom-agent --target x86_64-unknown-linux-gnu -- -D warnings
+
 ## Run Rust tests
 test:
 	cargo test --workspace --all-targets --all-features
 
 ## Run all checks
-check: fmt clippy build test
+check: fmt clippy clippy-linux build test
 
 # ── Docker ───────────────────────────────────────────────────────────
 
