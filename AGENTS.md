@@ -1,6 +1,6 @@
 # Phantom — Agent Instructions
 
-Phantom is a Rust-based API observability tool that captures HTTP/HTTPS traffic via a MITM proxy and presents it in a terminal UI. It is organized as a Cargo workspace of four library crates plus one binary.
+Phantom is a Rust-based API observability tool that captures HTTP/HTTPS traffic via a MITM proxy (or LD_PRELOAD agent on Linux) and presents it in a terminal UI. It is organized as a Cargo workspace of five library crates plus one binary.
 
 ---
 
@@ -11,8 +11,9 @@ src/main.rs                  # Binary entry point: CLI parsing, component wiring
 crates/
   phantom-core/              # Domain types, traits, error types — no I/O
   phantom-storage/           # Fjall LSM-tree TraceStore implementation
-  phantom-capture/           # Hudsucker MITM proxy CaptureBackend
+  phantom-capture/           # Hudsucker MITM proxy + LD_PRELOAD (Linux) CaptureBackend
   phantom-tui/               # Ratatui terminal UI
+  phantom-agent/             # LD_PRELOAD dylib (Linux only, hooks libc send/recv)
 Cargo.toml                   # Workspace root + binary crate
 plan.md                      # Japanese-language technical design document
 ```
@@ -22,6 +23,7 @@ plan.md                      # Japanese-language technical design document
 main → phantom-capture → phantom-core
 main → phantom-storage → phantom-core
 main → phantom-tui    → phantom-core
+phantom-agent          (standalone dylib, no workspace deps)
 ```
 
 `phantom-core` has zero internal-crate dependencies. All cross-component sharing is done via `Arc<dyn TraitFromPhantomCore>`.
@@ -31,21 +33,39 @@ main → phantom-tui    → phantom-core
 ## Build, Run, and Check Commands
 
 ```sh
-cargo build                  # Debug build
-cargo build --release        # Release build
-cargo run                    # Run proxy on default port 8080
-cargo run -- --port 9090     # Run with custom port
-cargo check                  # Fast type/borrow check (no codegen)
-cargo clippy                 # Lint (follow all suggestions)
-cargo fmt                    # Format all code
+cargo build                          # Debug build
+cargo build --workspace --all-targets --all-features  # Full build (matches CI)
+cargo build --release                # Release build
+cargo run                            # Run proxy on default port 8080
+cargo run -- --port 9090             # Run with custom port
+cargo run -- --backend ldpreload --agent-lib ./target/debug/libphantom_agent.so -- curl http://example.com
+cargo check                          # Fast type/borrow check (no codegen)
+cargo clippy --workspace --all-targets --all-features -- -D warnings  # Lint (CI-exact)
+cargo fmt --all                      # Format all code
+cargo fmt --all -- --check           # Check formatting (CI-exact)
+```
+
+### Makefile Shortcuts
+
+```sh
+make build    # cargo build --workspace --all-targets --all-features
+make fmt      # cargo fmt --all -- --check
+make fmt-fix  # cargo fmt --all
+make clippy   # cargo clippy ... -D warnings
+make test     # cargo test --workspace --all-targets --all-features
+make check    # fmt + clippy + build + test (full CI locally)
 ```
 
 ### CLI Options
 
 | Flag | Default | Description |
 |---|---|---|
+| `-b, --backend <BACKEND>` | `proxy` | `proxy` or `ldpreload` (Linux only) |
+| `-o, --output <OUTPUT>` | `tui` | `tui` (interactive) or `jsonl` (stdout stream) |
 | `-p, --port <PORT>` | `8080` | Proxy capture port |
 | `-d, --data-dir <DIR>` | `~/.local/share/phantom/data` | Storage directory |
+| `--agent-lib <PATH>` | — | Path to `libphantom_agent.so` (ldpreload backend) |
+| `-- <CMD>` | — | Command to run with LD_PRELOAD injected |
 
 ---
 
@@ -54,7 +74,9 @@ cargo fmt                    # Format all code
 ### Run All Tests
 
 ```sh
-cargo test --workspace
+cargo test --workspace --all-targets --all-features
+# or simply:
+make test
 ```
 
 ### Run Tests for a Single Crate
@@ -96,7 +118,7 @@ cargo test -p phantom-storage fjall_store::tests::test_insert_and_get
 
 - Edition: **2024** (`edition = "2024"` in all `Cargo.toml` files).
 - No `rust-toolchain.toml` or `rustfmt.toml` — use the default stable toolchain and default `rustfmt` settings.
-- All `cargo fmt` and `cargo clippy` output must be clean.
+- All `cargo fmt` and `cargo clippy` output must be clean. CI runs `clippy -- -D warnings`.
 
 ### Naming Conventions
 
@@ -136,6 +158,7 @@ use phantom_core::{CaptureError, HttpTrace};
 - Trailing commas on multi-line struct literals, enum variants, and function argument lists.
 - Prefer explicit `match` over chains of `if let` when exhaustiveness matters.
 - Keep lines to roughly 100 characters; longer lines are tolerated in UI rendering code.
+- Section dividers use `// ──────...` comment style (see existing files for width).
 
 ### Types and Generics
 
@@ -180,6 +203,12 @@ pub enum StorageError {
 - Use `mpsc::try_recv()` (non-blocking) to drain the capture channel on each TUI tick rather than `.await`-ing inside the render loop.
 - Channels (`mpsc`, `oneshot`) are the primary mechanism for crossing the async/sync boundary.
 
+### Platform-Specific Code
+
+- `phantom-agent` and `LdPreloadCaptureBackend` are **Linux-only**. Gate with `#[cfg(target_os = "linux")]` at the module and item level.
+- `phantom-agent` is a `dylib` crate — it has no workspace crate dependencies to avoid symbol conflicts.
+- IPC between agent and main process uses Unix datagram sockets (`PHANTOM_SOCKET` env var). Max datagram: 60 KB.
+
 ### Architecture Conventions
 
 - **`phantom-core` is the only source of shared types.** Do not define domain types in leaf crates.
@@ -194,16 +223,19 @@ pub enum StorageError {
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | CLI parsing (`clap` derive), component wiring |
+| `src/main.rs` | CLI parsing (`clap` derive), backend/output mode selection, component wiring |
 | `crates/phantom-core/src/trace.rs` | `HttpTrace`, `TraceId`, `SpanId`, `HttpMethod` |
 | `crates/phantom-core/src/storage.rs` | `TraceStore` trait |
 | `crates/phantom-core/src/capture.rs` | `CaptureBackend` trait |
 | `crates/phantom-core/src/error.rs` | `CaptureError`, `StorageError` |
 | `crates/phantom-storage/src/fjall_store.rs` | Storage implementation + all storage tests |
-| `crates/phantom-capture/src/proxy.rs` | MITM proxy implementation |
+| `crates/phantom-capture/src/proxy.rs` | MITM proxy implementation (cross-platform) |
+| `crates/phantom-capture/src/ldpreload.rs` | LD_PRELOAD capture backend (Linux only) |
+| `crates/phantom-agent/src/lib.rs` | LD_PRELOAD dylib: hooks libc `send`/`recv`/`close` |
 | `crates/phantom-tui/src/app.rs` | TUI state (`App`) and all state mutation |
 | `crates/phantom-tui/src/ui.rs` | Ratatui rendering functions |
 | `crates/phantom-tui/src/lib.rs` | TUI entry point and event loop |
+| `crates/phantom-tui/src/event.rs` | `EventHandler`: crossterm key events + tick |
 | `plan.md` | Comprehensive technical design (Japanese) |
 
 ---
@@ -218,10 +250,25 @@ HTTP traffic
   → fjall_store.rs FjallTraceStore::insert()  # batch write: traces + by_time + by_trace_id
   → app.rs App::add_trace()                   # prepends to traces Vec, bumps count
   → ui.rs render()                            # pure read of App state, no mutation
+
+LD_PRELOAD flow (Linux only):
+  → phantom-agent dylib hooks send()/recv()   # intercepts plain-text HTTP/1.x
+  → sends JSON datagrams over UnixDatagram    # PHANTOM_SOCKET env var
+  → ldpreload.rs LdPreloadCaptureBackend      # receives, parses, emits HttpTrace
+  → (same mpsc channel as proxy flow above)
 ```
 
 **Channel capacity:** 4096. Dropped traces logged via `tracing::warn!`.
 **Storage on startup:** `list_recent(1000, 0)` loads existing traces into `App` before event loop.
+
+---
+
+## Dependency Management
+
+- Shared dependencies are declared once in the `[workspace.dependencies]` table in the root `Cargo.toml` and referenced with `{ workspace = true }` in crate manifests.
+- When adding a new dependency, check `[workspace.dependencies]` first. If it is already there, use `workspace = true` rather than a separate version pin.
+- Prefer pure-Rust crates when available (e.g., Fjall over RocksDB, rcgen over OpenSSL-based cert generation).
+- `phantom-agent` intentionally pins its own dependency versions (no `workspace = true`) to stay self-contained as a dylib.
 
 ---
 
@@ -231,11 +278,5 @@ HTTP traffic
 |-------|-----------|-----------|
 | `phantom-core` | `crates/phantom-core/AGENTS.md` | Types, traits, error enums |
 | `phantom-storage` | `crates/phantom-storage/AGENTS.md` | Fjall partitions, index design |
-| `phantom-capture` | `crates/phantom-capture/AGENTS.md` | Hudsucker proxy, HTTPS interception |
+| `phantom-capture` | `crates/phantom-capture/AGENTS.md` | Hudsucker proxy, HTTPS interception, LD_PRELOAD backend |
 | `phantom-tui` | `crates/phantom-tui/AGENTS.md` | Ratatui loop, App state, rendering |
-
-## Dependency Management
-
-- Shared dependencies are declared once in the `[workspace.dependencies]` table in the root `Cargo.toml` and referenced with `{ workspace = true }` in crate manifests.
-- When adding a new dependency, check `[workspace.dependencies]` first. If it is already there, use `workspace = true` rather than a separate version pin.
-- Prefer pure-Rust crates when available (e.g., Fjall over RocksDB, rcgen over OpenSSL-based cert generation).
