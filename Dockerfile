@@ -70,6 +70,7 @@ RUN apt-get update \
         jq \
         ncat \
         openssl \
+        python3 \
  && rm -rf /var/lib/apt/lists/*
 
 # phantom binary

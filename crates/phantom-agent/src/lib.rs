@@ -6,8 +6,8 @@
 //! The agent hooks `send()` / `recv()` / `close()` from libc to intercept
 //! plain-text HTTP/1.x traffic, and `SSL_write()` / `SSL_read()` / `SSL_free()`
 //! from OpenSSL/LibreSSL/BoringSSL to intercept HTTPS traffic (plaintext above
-//! the TLS layer). Captured traces are sent as JSON datagrams over a Unix
-//! datagram socket to the phantom main process.
+//! the TLS layer). Both HTTP/1.x and HTTP/2 are captured. Captured traces are
+//! sent as JSON datagrams over a Unix datagram socket to the phantom main process.
 //!
 //! **Note**: HTTPS capture requires the target to dynamically link `libssl`.
 //! Statically-linked TLS (e.g. Go's native crypto, Rust's rustls) is not
@@ -80,6 +80,7 @@ struct TraceMsg {
     timestamp_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     dest_addr: Option<String>,
+    protocol_version: String,
 }
 
 fn emit_msg(msg: &TraceMsg) {
@@ -130,6 +131,384 @@ fn body_b64(raw: &[u8]) -> Option<String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HTTP/2 — constants, frame parsing, per-stream/connection state
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// HTTP/2 client connection preface (RFC 7540 §3.5).
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+/// Size of an HTTP/2 frame header in bytes.
+const H2_FRAME_HDR_LEN: usize = 9;
+// Frame types we care about.
+const H2_TYPE_DATA: u8 = 0x0;
+const H2_TYPE_HEADERS: u8 = 0x1;
+const H2_TYPE_CONTINUATION: u8 = 0x9;
+// Frame flags.
+const H2_FLAG_END_STREAM: u8 = 0x1;
+const H2_FLAG_END_HEADERS: u8 = 0x4;
+const H2_FLAG_PADDED: u8 = 0x8;
+const H2_FLAG_PRIORITY: u8 = 0x20;
+
+/// Parse the 9-byte HTTP/2 frame header.
+/// Returns `(payload_len, frame_type, flags, stream_id)` or `None` if buf is too short.
+fn parse_h2_frame_header(buf: &[u8]) -> Option<(usize, u8, u8, u32)> {
+    if buf.len() < H2_FRAME_HDR_LEN {
+        return None;
+    }
+    let payload_len = ((buf[0] as usize) << 16) | ((buf[1] as usize) << 8) | (buf[2] as usize);
+    let frame_type = buf[3];
+    let flags = buf[4];
+    // Mask off the reserved R bit (bit 31).
+    let stream_id = u32::from_be_bytes([buf[5] & 0x7f, buf[6], buf[7], buf[8]]);
+    Some((payload_len, frame_type, flags, stream_id))
+}
+
+/// Return the `[start, end)` byte range of the header block fragment within a
+/// HEADERS frame payload, stripping optional padding and priority bytes.
+fn h2_header_block_range(payload: &[u8], flags: u8) -> (usize, usize) {
+    let mut start = 0usize;
+    let mut end = payload.len();
+
+    if flags & H2_FLAG_PADDED != 0 {
+        if payload.is_empty() {
+            return (0, 0);
+        }
+        let pad_len = payload[0] as usize;
+        start += 1;
+        end = end.saturating_sub(pad_len);
+    }
+    if flags & H2_FLAG_PRIORITY != 0 {
+        start += 5; // 4 bytes stream dependency + 1 byte weight
+    }
+    if start > end { (0, 0) } else { (start, end) }
+}
+
+/// Per-stream state for a single HTTP/2 request-response pair.
+struct H2Stream {
+    req_method: Option<String>,
+    req_path: Option<String>,
+    req_authority: Option<String>,
+    req_scheme: Option<String>,
+    req_headers: HashMap<String, String>,
+    req_body: Vec<u8>,
+    /// True once we have seen END_STREAM on the request side.
+    req_done: bool,
+    started_at: Instant,
+    timestamp_ms: u64,
+    resp_status: Option<u16>,
+    resp_headers: HashMap<String, String>,
+    resp_body: Vec<u8>,
+    /// True once we have seen END_STREAM on the response side.
+    resp_done: bool,
+    tls: bool,
+}
+
+impl H2Stream {
+    fn new(tls: bool) -> Self {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            req_method: None,
+            req_path: None,
+            req_authority: None,
+            req_scheme: None,
+            req_headers: HashMap::new(),
+            req_body: Vec::new(),
+            req_done: false,
+            started_at: Instant::now(),
+            timestamp_ms: ts,
+            resp_status: None,
+            resp_headers: HashMap::new(),
+            resp_body: Vec::new(),
+            resp_done: false,
+            tls,
+        }
+    }
+}
+
+/// Per-connection state for an HTTP/2 connection.
+struct H2ConnState {
+    tls: bool,
+    /// Buffered outgoing (app→server) bytes not yet consumed into complete frames.
+    send_buf: Vec<u8>,
+    /// Buffered incoming (server→app) bytes not yet consumed into complete frames.
+    recv_buf: Vec<u8>,
+    /// HPACK decoder for client-sent request headers.
+    send_hpack: hpack::Decoder<'static>,
+    /// HPACK decoder for server-sent response headers.
+    recv_hpack: hpack::Decoder<'static>,
+    /// Active streams keyed by HTTP/2 stream ID.
+    streams: HashMap<u32, H2Stream>,
+    // CONTINUATION frame accumulation (send direction).
+    send_cont_sid: Option<u32>,
+    send_cont_buf: Vec<u8>,
+    send_cont_end_stream: bool,
+    // CONTINUATION frame accumulation (recv direction).
+    recv_cont_sid: Option<u32>,
+    recv_cont_buf: Vec<u8>,
+    recv_cont_end_stream: bool,
+}
+
+impl H2ConnState {
+    fn new(tls: bool) -> Self {
+        Self {
+            tls,
+            send_buf: Vec::new(),
+            recv_buf: Vec::new(),
+            send_hpack: hpack::Decoder::new(),
+            recv_hpack: hpack::Decoder::new(),
+            streams: HashMap::new(),
+            send_cont_sid: None,
+            send_cont_buf: Vec::new(),
+            send_cont_end_stream: false,
+            recv_cont_sid: None,
+            recv_cont_buf: Vec::new(),
+            recv_cont_end_stream: false,
+        }
+    }
+}
+
+/// Apply decoded HPACK name-value pairs to a stream's request pseudo-headers and
+/// regular headers.
+fn apply_h2_request_headers(stream: &mut H2Stream, headers: Vec<(Vec<u8>, Vec<u8>)>) {
+    for (name, value) in headers {
+        let name = String::from_utf8_lossy(&name).into_owned();
+        let value = String::from_utf8_lossy(&value).into_owned();
+        match name.as_str() {
+            ":method" => stream.req_method = Some(value),
+            ":path" => stream.req_path = Some(value),
+            ":scheme" => stream.req_scheme = Some(value),
+            ":authority" => stream.req_authority = Some(value),
+            n if !n.starts_with(':') => {
+                stream.req_headers.insert(n.to_string(), value);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Apply decoded HPACK name-value pairs to a stream's response pseudo-headers and
+/// regular headers.
+fn apply_h2_response_headers(stream: &mut H2Stream, headers: Vec<(Vec<u8>, Vec<u8>)>) {
+    for (name, value) in headers {
+        let name = String::from_utf8_lossy(&name).into_owned();
+        let value = String::from_utf8_lossy(&value).into_owned();
+        if name == ":status" {
+            stream.resp_status = value.parse().ok();
+        } else if !name.starts_with(':') {
+            stream.resp_headers.insert(name, value);
+        }
+    }
+}
+
+/// Process all complete HTTP/2 frames in `h2.send_buf` (outgoing / request side).
+fn process_h2_send_frames(h2: &mut H2ConnState) {
+    // Skip the 24-byte client connection preface if present at the start.
+    if h2.send_buf.starts_with(H2_PREFACE) {
+        h2.send_buf.drain(..H2_PREFACE.len());
+    }
+
+    loop {
+        let Some((payload_len, frame_type, flags, stream_id)) = parse_h2_frame_header(&h2.send_buf)
+        else {
+            break;
+        };
+        let total = H2_FRAME_HDR_LEN + payload_len;
+        if h2.send_buf.len() < total {
+            break; // Frame not yet fully buffered.
+        }
+
+        // Clone payload so we can drain the buffer cleanly.
+        let payload = h2.send_buf[H2_FRAME_HDR_LEN..total].to_vec();
+        h2.send_buf.drain(..total);
+
+        let tls = h2.tls;
+        match frame_type {
+            H2_TYPE_HEADERS if stream_id > 0 => {
+                let end_stream = flags & H2_FLAG_END_STREAM != 0;
+                let end_headers = flags & H2_FLAG_END_HEADERS != 0;
+                let (hb_start, hb_end) = h2_header_block_range(&payload, flags);
+                let hblock = &payload[hb_start..hb_end];
+
+                if end_headers {
+                    let decoded = h2.send_hpack.decode(hblock).unwrap_or_default();
+                    let stream = h2
+                        .streams
+                        .entry(stream_id)
+                        .or_insert_with(|| H2Stream::new(tls));
+                    apply_h2_request_headers(stream, decoded);
+                    stream.req_done |= end_stream;
+                } else {
+                    // Header block continues in CONTINUATION frames.
+                    h2.send_cont_sid = Some(stream_id);
+                    h2.send_cont_buf = hblock.to_vec();
+                    h2.send_cont_end_stream = end_stream;
+                }
+            }
+            H2_TYPE_DATA if stream_id > 0 => {
+                let end_stream = flags & H2_FLAG_END_STREAM != 0;
+                // Strip padding.
+                let (data_start, data_end) = if flags & H2_FLAG_PADDED != 0 && !payload.is_empty() {
+                    let pad = payload[0] as usize;
+                    (1, payload.len().saturating_sub(pad))
+                } else {
+                    (0, payload.len())
+                };
+                if let Some(stream) = h2.streams.get_mut(&stream_id) {
+                    if stream.req_body.len() < MAX_BUF {
+                        stream
+                            .req_body
+                            .extend_from_slice(&payload[data_start..data_end]);
+                    }
+                    stream.req_done |= end_stream;
+                }
+            }
+            H2_TYPE_CONTINUATION if stream_id > 0 => {
+                if h2.send_cont_sid == Some(stream_id) {
+                    h2.send_cont_buf.extend_from_slice(&payload);
+                    if flags & H2_FLAG_END_HEADERS != 0 {
+                        let hblock = std::mem::take(&mut h2.send_cont_buf);
+                        let decoded = h2.send_hpack.decode(&hblock).unwrap_or_default();
+                        let end_stream = h2.send_cont_end_stream;
+                        let stream = h2
+                            .streams
+                            .entry(stream_id)
+                            .or_insert_with(|| H2Stream::new(tls));
+                        apply_h2_request_headers(stream, decoded);
+                        stream.req_done |= end_stream;
+                        h2.send_cont_sid = None;
+                        h2.send_cont_end_stream = false;
+                    }
+                }
+            }
+            _ => {} // SETTINGS, WINDOW_UPDATE, PING, GOAWAY, etc. — ignore.
+        }
+    }
+}
+
+/// Process all complete HTTP/2 frames in `h2.recv_buf` (incoming / response side).
+fn process_h2_recv_frames(h2: &mut H2ConnState) {
+    loop {
+        let Some((payload_len, frame_type, flags, stream_id)) = parse_h2_frame_header(&h2.recv_buf)
+        else {
+            break;
+        };
+        let total = H2_FRAME_HDR_LEN + payload_len;
+        if h2.recv_buf.len() < total {
+            break;
+        }
+
+        let payload = h2.recv_buf[H2_FRAME_HDR_LEN..total].to_vec();
+        h2.recv_buf.drain(..total);
+
+        let tls = h2.tls;
+        match frame_type {
+            H2_TYPE_HEADERS if stream_id > 0 => {
+                let end_stream = flags & H2_FLAG_END_STREAM != 0;
+                let end_headers = flags & H2_FLAG_END_HEADERS != 0;
+                let (hb_start, hb_end) = h2_header_block_range(&payload, flags);
+                let hblock = &payload[hb_start..hb_end];
+
+                if end_headers {
+                    let decoded = h2.recv_hpack.decode(hblock).unwrap_or_default();
+                    let stream = h2
+                        .streams
+                        .entry(stream_id)
+                        .or_insert_with(|| H2Stream::new(tls));
+                    apply_h2_response_headers(stream, decoded);
+                    stream.resp_done |= end_stream;
+                } else {
+                    h2.recv_cont_sid = Some(stream_id);
+                    h2.recv_cont_buf = hblock.to_vec();
+                    h2.recv_cont_end_stream = end_stream;
+                }
+            }
+            H2_TYPE_DATA if stream_id > 0 => {
+                let end_stream = flags & H2_FLAG_END_STREAM != 0;
+                let (data_start, data_end) = if flags & H2_FLAG_PADDED != 0 && !payload.is_empty() {
+                    let pad = payload[0] as usize;
+                    (1, payload.len().saturating_sub(pad))
+                } else {
+                    (0, payload.len())
+                };
+                if let Some(stream) = h2.streams.get_mut(&stream_id) {
+                    if stream.resp_body.len() < MAX_BUF {
+                        stream
+                            .resp_body
+                            .extend_from_slice(&payload[data_start..data_end]);
+                    }
+                    stream.resp_done |= end_stream;
+                }
+            }
+            H2_TYPE_CONTINUATION if stream_id > 0 => {
+                if h2.recv_cont_sid == Some(stream_id) {
+                    h2.recv_cont_buf.extend_from_slice(&payload);
+                    if flags & H2_FLAG_END_HEADERS != 0 {
+                        let hblock = std::mem::take(&mut h2.recv_cont_buf);
+                        let decoded = h2.recv_hpack.decode(&hblock).unwrap_or_default();
+                        let end_stream = h2.recv_cont_end_stream;
+                        let stream = h2
+                            .streams
+                            .entry(stream_id)
+                            .or_insert_with(|| H2Stream::new(tls));
+                        apply_h2_response_headers(stream, decoded);
+                        stream.resp_done |= end_stream;
+                        h2.recv_cont_sid = None;
+                        h2.recv_cont_end_stream = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Remove and return all streams that have a complete response (status + END_STREAM).
+fn drain_completed_h2_streams(h2: &mut H2ConnState) -> Vec<H2Stream> {
+    let done_ids: Vec<u32> = h2
+        .streams
+        .iter()
+        .filter(|(_, s)| s.resp_status.is_some() && s.resp_done)
+        .map(|(id, _)| *id)
+        .collect();
+    let mut completed = Vec::with_capacity(done_ids.len());
+    for id in done_ids {
+        if let Some(stream) = h2.streams.remove(&id) {
+            completed.push(stream);
+        }
+    }
+    completed
+}
+
+/// Build and send a `TraceMsg` for a completed HTTP/2 stream.
+fn emit_h2_stream(stream: H2Stream) {
+    let method = stream.req_method.unwrap_or_else(|| "GET".to_string());
+    let path = stream.req_path.unwrap_or_else(|| "/".to_string());
+    let authority = stream.req_authority.unwrap_or_default();
+    let scheme = stream
+        .req_scheme
+        .unwrap_or_else(|| if stream.tls { "https" } else { "http" }.to_string());
+    let url = format!("{scheme}://{authority}{path}");
+    let status_code = stream.resp_status.unwrap_or(0);
+    let duration = stream.started_at.elapsed();
+
+    emit_msg(&TraceMsg {
+        method,
+        url,
+        status_code,
+        request_headers: stream.req_headers,
+        response_headers: stream.resp_headers,
+        request_body_b64: body_b64(&stream.req_body),
+        response_body_b64: body_b64(&stream.resp_body),
+        duration_ms: duration.as_millis() as u64,
+        timestamp_ms: stream.timestamp_ms,
+        dest_addr: None,
+        protocol_version: "HTTP/2".to_string(),
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Per-connection state machine
 //
 // Keyed by `usize`: file descriptors (small integers) for plain sockets,
@@ -161,6 +540,8 @@ enum FdState {
         content_length: Option<usize>,
         headers_end: Option<usize>,
     },
+    /// HTTP/2 connection (may carry many multiplexed streams).
+    Http2(Box<H2ConnState>),
 }
 
 static STATE_MAP: OnceLock<Mutex<HashMap<usize, FdState>>> = OnceLock::new();
@@ -288,7 +669,7 @@ fn try_parse_response_headers(buf: &[u8]) -> Option<RespMeta> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Emit a completed trace
+// Emit a completed HTTP/1.x trace
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn do_emit(
@@ -315,6 +696,7 @@ fn do_emit(
         duration_ms: duration.as_millis() as u64,
         timestamp_ms: req.timestamp_ms,
         dest_addr: None,
+        protocol_version: "HTTP/1.1".to_string(),
     });
 }
 
@@ -331,6 +713,25 @@ fn process_outgoing(key: usize, data: &[u8], tls: bool) {
         Err(_) => return,
     };
 
+    // ── HTTP/2 path ──────────────────────────────────────────────────────────
+    // If we already know this connection is HTTP/2, route directly.
+    if let Some(FdState::Http2(h2)) = map.get_mut(&key) {
+        if h2.send_buf.len() < MAX_BUF {
+            h2.send_buf.extend_from_slice(data);
+        }
+        process_h2_send_frames(h2);
+        return;
+    }
+    // Detect a new HTTP/2 connection by its client preface.
+    if data.starts_with(H2_PREFACE) {
+        let mut h2 = Box::new(H2ConnState::new(tls));
+        h2.send_buf.extend_from_slice(data);
+        process_h2_send_frames(&mut h2);
+        map.insert(key, FdState::Http2(h2));
+        return;
+    }
+
+    // ── HTTP/1.x path ────────────────────────────────────────────────────────
     if looks_like_http_request(data) {
         // Start fresh tracking for this key (may overwrite stale state).
         let buf = data.to_vec();
@@ -380,6 +781,33 @@ fn process_outgoing(key: usize, data: &[u8], tls: bool) {
 }
 
 fn process_incoming(key: usize, data: &[u8]) {
+    // ── HTTP/2 path ──────────────────────────────────────────────────────────
+    // Handle HTTP/2 streams, collecting those that have a complete response.
+    // We release the lock before emitting.
+    let h2_completed = {
+        let mut map = match state_map().lock() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        if let Some(FdState::Http2(h2)) = map.get_mut(&key) {
+            if h2.recv_buf.len() < MAX_BUF {
+                h2.recv_buf.extend_from_slice(data);
+            }
+            process_h2_recv_frames(h2);
+            Some(drain_completed_h2_streams(h2))
+        } else {
+            None
+        }
+    }; // lock released
+
+    if let Some(completed) = h2_completed {
+        for stream in completed {
+            emit_h2_stream(stream);
+        }
+        return;
+    }
+
+    // ── HTTP/1.x path ────────────────────────────────────────────────────────
     // Phase 1: accumulate, parse headers if ready, check completeness.
     // Return owned FdState if the response is complete (to emit outside the lock).
     let to_emit = {
@@ -454,23 +882,33 @@ fn process_teardown(key: usize) {
         map.remove(&key)
     }; // Lock released
 
-    // Emit partial response (e.g. chunked or connection-close semantics).
-    if let Some(FdState::CollectingResponse {
-        req,
-        buf,
-        tls,
-        status_code: Some(sc),
-        resp_headers: Some(rh),
-        content_length,
-        headers_end: Some(he),
-    }) = state
-    {
-        let cl = content_length.unwrap_or_else(|| buf.len().saturating_sub(he));
-        let body_end = (he + cl).min(buf.len());
-        let duration = req.started_at.elapsed();
-        do_emit(*req, sc, rh, &buf[he..body_end], duration, tls);
+    match state {
+        // HTTP/1.x: emit partial response (e.g. chunked or connection-close semantics).
+        Some(FdState::CollectingResponse {
+            req,
+            buf,
+            tls,
+            status_code: Some(sc),
+            resp_headers: Some(rh),
+            content_length,
+            headers_end: Some(he),
+        }) => {
+            let cl = content_length.unwrap_or_else(|| buf.len().saturating_sub(he));
+            let body_end = (he + cl).min(buf.len());
+            let duration = req.started_at.elapsed();
+            do_emit(*req, sc, rh, &buf[he..body_end], duration, tls);
+        }
+        // HTTP/2: emit any streams for which we received at least a response status.
+        Some(FdState::Http2(h2)) => {
+            for (_sid, stream) in h2.streams {
+                if stream.resp_status.is_some() {
+                    emit_h2_stream(stream);
+                }
+            }
+        }
+        // If headers were never parsed, we have nothing useful to emit.
+        _ => {}
     }
-    // If headers were never parsed, we have nothing useful to emit.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

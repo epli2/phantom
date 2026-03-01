@@ -33,6 +33,8 @@ struct AgentTrace {
     duration_ms: u64,
     timestamp_ms: u64,
     dest_addr: Option<String>,
+    #[serde(default)]
+    protocol_version: Option<String>,
 }
 
 fn parse_method(s: &str) -> HttpMethod {
@@ -84,7 +86,7 @@ fn agent_trace_to_http_trace(a: AgentTrace) -> HttpTrace {
         duration: Duration::from_millis(a.duration_ms),
         source_addr: None,
         dest_addr: a.dest_addr,
-        protocol_version: "HTTP/1.1".to_string(),
+        protocol_version: a.protocol_version.unwrap_or_else(|| "HTTP/1.1".to_string()),
     }
 }
 
