@@ -94,7 +94,7 @@ fn emit_msg(msg: &TraceMsg) {
 
 fn b64_encode(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
@@ -143,7 +143,7 @@ enum FdState {
     CollectingRequest { buf: Vec<u8> },
     /// Request fully parsed; accumulating HTTP response bytes.
     CollectingResponse {
-        req: ReqInfo,
+        req: Box<ReqInfo>,
         buf: Vec<u8>,
         // Populated once response headers are parsed:
         status_code: Option<u16>,
@@ -319,7 +319,7 @@ fn process_send(fd: i32, data: &[u8]) {
             map.insert(
                 fd,
                 FdState::CollectingResponse {
-                    req: req_info,
+                    req: Box::new(req_info),
                     buf: Vec::new(),
                     status_code: None,
                     resp_headers: None,
@@ -347,7 +347,7 @@ fn process_send(fd: i32, data: &[u8]) {
             map.insert(
                 fd,
                 FdState::CollectingResponse {
-                    req: req_info,
+                    req: Box::new(req_info),
                     buf: Vec::new(),
                     status_code: None,
                     resp_headers: None,
@@ -382,6 +382,7 @@ fn process_recv(fd: i32, data: &[u8]) {
                 }
 
                 // Parse response headers once.
+                #[allow(clippy::collapsible_if)]
                 if headers_end.is_none() {
                     if let Some(meta) = try_parse_response_headers(buf) {
                         *status_code = Some(meta.status_code);
@@ -419,7 +420,7 @@ fn process_recv(fd: i32, data: &[u8]) {
         let cl = content_length.unwrap_or(0);
         let body_end = (he + cl).min(buf.len());
         let duration = req.started_at.elapsed();
-        do_emit(req, sc, rh, &buf[he..body_end], duration);
+        do_emit(*req, sc, rh, &buf[he..body_end], duration);
     }
 }
 
@@ -445,7 +446,7 @@ fn process_close(fd: i32) {
         let cl = content_length.unwrap_or_else(|| buf.len().saturating_sub(he));
         let body_end = (he + cl).min(buf.len());
         let duration = req.started_at.elapsed();
-        do_emit(req, sc, rh, &buf[he..body_end], duration);
+        do_emit(*req, sc, rh, &buf[he..body_end], duration);
     }
     // If headers were never parsed, we have nothing useful to emit.
 }
