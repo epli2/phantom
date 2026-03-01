@@ -1,5 +1,8 @@
 .DEFAULT_GOAL := help
-.PHONY: help build test-ldpreload test-proxy test-jsonl shell clean fmt clippy test ci
+.PHONY: help build release release-linux release-linux-aarch64 test-ldpreload test-proxy test-jsonl shell clean fmt clippy test ci
+
+LINUX_X86_64  := x86_64-unknown-linux-gnu
+LINUX_AARCH64 := aarch64-unknown-linux-gnu
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 
@@ -7,8 +10,11 @@ help:
 	@echo "phantom — Tasks"
 	@echo ""
 	@echo "Build:"
-	@echo "  make build           Build the project"
-	@echo "  make clean           Clean the build"
+	@echo "  make build                Build the project (debug)"
+	@echo "  make release              Build the project (optimised release)"
+	@echo "  make release-linux        Cross-compile release for Linux x86_64  (requires cargo-zigbuild + zig)"
+	@echo "  make release-linux-aarch64  Cross-compile release for Linux aarch64 (requires cargo-zigbuild + zig)"
+	@echo "  make clean                Clean the build"
 	@echo ""
 	@echo "Checks:"
 	@echo "  make fmt             Format Rust code"
@@ -34,6 +40,24 @@ help:
 
 build:
 	cargo build --workspace --all-targets --all-features
+
+## Optimised release build (native platform)
+release:
+	cargo build --release --workspace --all-features
+
+## Cross-compile release for Linux x86_64
+## Requires: brew install zig && cargo install cargo-zigbuild
+## Output: target/x86_64-unknown-linux-gnu/release/{phantom,libphantom_agent.so}
+release-linux:
+	rustup target add $(LINUX_X86_64)
+	cargo zigbuild --release --workspace --all-features --target $(LINUX_X86_64)
+
+## Cross-compile release for Linux aarch64
+## Requires: brew install zig && cargo install cargo-zigbuild
+## Output: target/aarch64-unknown-linux-gnu/release/{phantom,libphantom_agent.so}
+release-linux-aarch64:
+	rustup target add $(LINUX_AARCH64)
+	cargo zigbuild --release --workspace --all-features --target $(LINUX_AARCH64)
 
 clean:
 	cargo clean
