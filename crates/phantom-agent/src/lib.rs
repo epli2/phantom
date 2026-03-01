@@ -149,7 +149,7 @@ struct ReqInfo {
 
 enum FdState {
     /// Still accumulating the HTTP request bytes.
-    CollectingRequest { buf: Vec<u8>, tls: bool },
+    CollectingRequest { buf: Vec<u8> },
     /// Request fully parsed; accumulating HTTP response bytes.
     CollectingResponse {
         req: Box<ReqInfo>,
@@ -348,11 +348,11 @@ fn process_outgoing(key: usize, data: &[u8], tls: bool) {
                 },
             );
         } else {
-            map.insert(key, FdState::CollectingRequest { buf, tls });
+            map.insert(key, FdState::CollectingRequest { buf });
         }
     } else {
         // Possible continuation of an incomplete request.
-        let transition = if let Some(FdState::CollectingRequest { buf, .. }) = map.get_mut(&key) {
+        let transition = if let Some(FdState::CollectingRequest { buf }) = map.get_mut(&key) {
             if buf.len() < MAX_BUF {
                 buf.extend_from_slice(data);
             }
