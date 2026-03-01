@@ -667,7 +667,7 @@ dependencies = [
  "byteorder",
  "byteview",
  "dashmap",
- "log",
+ "log 0.4.29",
  "lsm-tree",
  "path-absolutize",
  "std-semaphore",
@@ -797,7 +797,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "libc",
- "log",
+ "log 0.4.29",
  "rustversion",
  "windows-link",
  "windows-result",
@@ -883,6 +883,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hpack"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c68f61350ad23817dd207b035b5258d91ac5eaef69e96f906628aaed8854dda"
+dependencies = [
+ "log 0.3.9",
+]
 
 [[package]]
 name = "http"
@@ -989,7 +998,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "log",
+ "log 0.4.29",
  "rustls",
  "rustls-pki-types",
  "tokio",
@@ -1288,6 +1297,15 @@ dependencies = [
 
 [[package]]
 name = "log"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e19e8d5c34a3e0e2223db8e060f9e8264aeeb5c5fc64a4ee9965c062211c024b"
+dependencies = [
+ "log 0.4.29",
+]
+
+[[package]]
+name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
@@ -1329,7 +1347,7 @@ dependencies = [
  "enum_dispatch",
  "guardian",
  "interval-heap",
- "log",
+ "log 0.4.29",
  "lz4_flex",
  "path-absolutize",
  "quick_cache",
@@ -1385,7 +1403,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
 dependencies = [
  "libc",
- "log",
+ "log 0.4.29",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -1582,6 +1600,7 @@ dependencies = [
 name = "phantom-agent"
 version = "0.1.0"
 dependencies = [
+ "hpack",
  "httparse",
  "libc",
  "redhook",
@@ -1904,7 +1923,7 @@ version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf4ef73721ac7bcd79b2b315da7779d8fc09718c6b3d2d1b2d94850eb8c18432"
 dependencies = [
- "log",
+ "log 0.4.29",
  "ring",
  "rustls-pki-types",
  "rustls-webpki",
@@ -2338,7 +2357,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c83b561d025642014097b66e6c1bb422783339e0909e4429cde4749d1990bc38"
 dependencies = [
  "futures-util",
- "log",
+ "log 0.4.29",
  "rustls",
  "rustls-pki-types",
  "tokio",
@@ -2372,7 +2391,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
- "log",
+ "log 0.4.29",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -2405,7 +2424,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
 dependencies = [
- "log",
+ "log 0.4.29",
  "once_cell",
  "tracing-core",
 ]
@@ -2445,7 +2464,7 @@ dependencies = [
  "data-encoding",
  "http",
  "httparse",
- "log",
+ "log 0.4.29",
  "rand",
  "rustls",
  "rustls-pki-types",
@@ -2564,7 +2583,7 @@ dependencies = [
  "byteorder",
  "byteview",
  "interval-heap",
- "log",
+ "log 0.4.29",
  "path-absolutize",
  "rustc-hash",
  "tempfile",
@@ -2976,7 +2995,7 @@ dependencies = [
  "anyhow",
  "bitflags",
  "indexmap",
- "log",
+ "log 0.4.29",
  "serde",
  "serde_derive",
  "serde_json",
@@ -2995,7 +3014,7 @@ dependencies = [
  "anyhow",
  "id-arena",
  "indexmap",
- "log",
+ "log 0.4.29",
  "semver",
  "serde",
  "serde_derive",
