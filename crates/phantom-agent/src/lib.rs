@@ -4,11 +4,14 @@
 //!   `LD_PRELOAD=/path/to/libphantom_agent.so PHANTOM_SOCKET=/tmp/phantom.sock <cmd>`
 //!
 //! The agent hooks `send()` / `recv()` / `close()` from libc to intercept
-//! plain-text HTTP/1.x traffic. Captured traces are sent as JSON datagrams
-//! over a Unix datagram socket to the phantom main process.
+//! plain-text HTTP/1.x traffic, and `SSL_write()` / `SSL_read()` / `SSL_free()`
+//! from OpenSSL/LibreSSL/BoringSSL to intercept HTTPS traffic (plaintext above
+//! the TLS layer). Captured traces are sent as JSON datagrams over a Unix
+//! datagram socket to the phantom main process.
 //!
-//! **Limitation**: HTTPS traffic is encrypted at the socket layer and cannot
-//! be captured this way (would require hooking OpenSSL/GnuTLS functions).
+//! **Note**: HTTPS capture requires the target to dynamically link `libssl`.
+//! Statically-linked TLS (e.g. Go's native crypto, Rust's rustls) is not
+//! captured — use the proxy backend for those cases.
 
 #![cfg(target_os = "linux")]
 
@@ -21,7 +24,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use libc::{c_int, c_void, size_t, ssize_t};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Re-entry guard — prevents recursive hook calls (e.g. if our code calls send)
+// Re-entry guard — prevents recursive hook calls (e.g. if our code calls send,
+// or SSL_write internally calls send)
 // ─────────────────────────────────────────────────────────────────────────────
 
 thread_local! {
@@ -39,7 +43,7 @@ thread_local! {
 const MAX_DATAGRAM: usize = 60_000;
 /// Maximum body bytes stored per trace (keeps datagrams small).
 const MAX_BODY: usize = 16_384;
-/// Maximum bytes we buffer per FD before giving up.
+/// Maximum bytes we buffer per connection before giving up.
 const MAX_BUF: usize = 512 * 1024;
 
 static IPC_SOCKET: OnceLock<Option<(UnixDatagram, String)>> = OnceLock::new();
@@ -126,7 +130,12 @@ fn body_b64(raw: &[u8]) -> Option<String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Per-FD state machine
+// Per-connection state machine
+//
+// Keyed by `usize`: file descriptors (small integers) for plain sockets,
+// SSL* pointer addresses (large heap values) for TLS connections.
+// No collision is possible because FDs are in [0, 65535] and heap pointers
+// are well above that range on 64-bit systems.
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct ReqInfo {
@@ -140,11 +149,12 @@ struct ReqInfo {
 
 enum FdState {
     /// Still accumulating the HTTP request bytes.
-    CollectingRequest { buf: Vec<u8> },
+    CollectingRequest { buf: Vec<u8>, tls: bool },
     /// Request fully parsed; accumulating HTTP response bytes.
     CollectingResponse {
         req: Box<ReqInfo>,
         buf: Vec<u8>,
+        tls: bool,
         // Populated once response headers are parsed:
         status_code: Option<u16>,
         resp_headers: Option<HashMap<String, String>>,
@@ -153,10 +163,10 @@ enum FdState {
     },
 }
 
-static FD_MAP: OnceLock<Mutex<HashMap<i32, FdState>>> = OnceLock::new();
+static STATE_MAP: OnceLock<Mutex<HashMap<usize, FdState>>> = OnceLock::new();
 
-fn fd_map() -> &'static Mutex<HashMap<i32, FdState>> {
-    FD_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+fn state_map() -> &'static Mutex<HashMap<usize, FdState>> {
+    STATE_MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -287,10 +297,16 @@ fn do_emit(
     resp_headers: HashMap<String, String>,
     resp_body: &[u8],
     duration: Duration,
+    tls: bool,
 ) {
+    let url = if tls && req.url.starts_with("http://") {
+        req.url.replacen("http://", "https://", 1)
+    } else {
+        req.url
+    };
     emit_msg(&TraceMsg {
         method: req.method,
-        url: req.url,
+        url,
         status_code,
         request_headers: req.headers,
         response_headers: resp_headers,
@@ -304,23 +320,27 @@ fn do_emit(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Hook processing (called from within hooks, after re-entry check)
+//
+// `key` is either an FD (cast to usize) or an SSL* pointer (cast to usize).
+// `tls` indicates whether the data comes from an SSL function.
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn process_send(fd: i32, data: &[u8]) {
-    let mut map = match fd_map().lock() {
+fn process_outgoing(key: usize, data: &[u8], tls: bool) {
+    let mut map = match state_map().lock() {
         Ok(m) => m,
         Err(_) => return,
     };
 
     if looks_like_http_request(data) {
-        // Start fresh tracking for this fd (may overwrite stale state).
+        // Start fresh tracking for this key (may overwrite stale state).
         let buf = data.to_vec();
         if let Some(req_info) = try_parse_request(&buf) {
             map.insert(
-                fd,
+                key,
                 FdState::CollectingResponse {
                     req: Box::new(req_info),
                     buf: Vec::new(),
+                    tls,
                     status_code: None,
                     resp_headers: None,
                     content_length: None,
@@ -328,27 +348,27 @@ fn process_send(fd: i32, data: &[u8]) {
                 },
             );
         } else {
-            map.insert(fd, FdState::CollectingRequest { buf });
+            map.insert(key, FdState::CollectingRequest { buf, tls });
         }
     } else {
         // Possible continuation of an incomplete request.
-        // Use a flag to avoid holding the borrow when we call map.insert().
-        let transition = if let Some(FdState::CollectingRequest { buf }) = map.get_mut(&fd) {
+        let transition = if let Some(FdState::CollectingRequest { buf, .. }) = map.get_mut(&key) {
             if buf.len() < MAX_BUF {
                 buf.extend_from_slice(data);
             }
             try_parse_request(buf) // returns owned ReqInfo if complete
         } else {
-            return; // not tracking this fd
+            return; // not tracking this key
         };
 
         // Borrow of map.get_mut() ends here (transition is owned).
         if let Some(req_info) = transition {
             map.insert(
-                fd,
+                key,
                 FdState::CollectingResponse {
                     req: Box::new(req_info),
                     buf: Vec::new(),
+                    tls,
                     status_code: None,
                     resp_headers: None,
                     content_length: None,
@@ -359,16 +379,16 @@ fn process_send(fd: i32, data: &[u8]) {
     }
 }
 
-fn process_recv(fd: i32, data: &[u8]) {
+fn process_incoming(key: usize, data: &[u8]) {
     // Phase 1: accumulate, parse headers if ready, check completeness.
     // Return owned FdState if the response is complete (to emit outside the lock).
     let to_emit = {
-        let mut map = match fd_map().lock() {
+        let mut map = match state_map().lock() {
             Ok(m) => m,
             Err(_) => return,
         };
 
-        let complete = match map.get_mut(&fd) {
+        let complete = match map.get_mut(&key) {
             Some(FdState::CollectingResponse {
                 buf,
                 status_code,
@@ -402,7 +422,7 @@ fn process_recv(fd: i32, data: &[u8]) {
         };
 
         if complete {
-            map.remove(&fd) // → Option<FdState>, owned
+            map.remove(&key) // → Option<FdState>, owned
         } else {
             None
         }
@@ -411,6 +431,7 @@ fn process_recv(fd: i32, data: &[u8]) {
     if let Some(FdState::CollectingResponse {
         req,
         buf,
+        tls,
         status_code: Some(sc),
         resp_headers: Some(rh),
         content_length,
@@ -420,23 +441,24 @@ fn process_recv(fd: i32, data: &[u8]) {
         let cl = content_length.unwrap_or(0);
         let body_end = (he + cl).min(buf.len());
         let duration = req.started_at.elapsed();
-        do_emit(*req, sc, rh, &buf[he..body_end], duration);
+        do_emit(*req, sc, rh, &buf[he..body_end], duration, tls);
     }
 }
 
-fn process_close(fd: i32) {
+fn process_teardown(key: usize) {
     let state = {
-        let mut map = match fd_map().lock() {
+        let mut map = match state_map().lock() {
             Ok(m) => m,
             Err(_) => return,
         };
-        map.remove(&fd)
+        map.remove(&key)
     }; // Lock released
 
     // Emit partial response (e.g. chunked or connection-close semantics).
     if let Some(FdState::CollectingResponse {
         req,
         buf,
+        tls,
         status_code: Some(sc),
         resp_headers: Some(rh),
         content_length,
@@ -446,13 +468,13 @@ fn process_close(fd: i32) {
         let cl = content_length.unwrap_or_else(|| buf.len().saturating_sub(he));
         let body_end = (he + cl).min(buf.len());
         let duration = req.started_at.elapsed();
-        do_emit(*req, sc, rh, &buf[he..body_end], duration);
+        do_emit(*req, sc, rh, &buf[he..body_end], duration, tls);
     }
     // If headers were never parsed, we have nothing useful to emit.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Hooks
+// Hooks — libc (plain HTTP)
 // ─────────────────────────────────────────────────────────────────────────────
 
 redhook::hook! {
@@ -470,7 +492,7 @@ redhook::hook! {
                     g.set(true);
                     // SAFETY: buf points to `result` readable bytes (guaranteed by send contract).
                     let data = unsafe { std::slice::from_raw_parts(buf as *const u8, result as usize) };
-                    process_send(sockfd, data);
+                    process_outgoing(sockfd as usize, data, false);
                     g.set(false);
                 }
             });
@@ -494,7 +516,7 @@ redhook::hook! {
                     g.set(true);
                     // SAFETY: buf holds `result` initialised bytes written by recv(2).
                     let data = unsafe { std::slice::from_raw_parts(buf as *const u8, result as usize) };
-                    process_recv(sockfd, data);
+                    process_incoming(sockfd as usize, data);
                     g.set(false);
                 }
             });
@@ -510,10 +532,79 @@ redhook::hook! {
         IN_HOOK.with(|g| {
             if !g.get() {
                 g.set(true);
-                process_close(fd);
+                process_teardown(fd as usize);
                 g.set(false);
             }
         });
         result
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hooks — OpenSSL / LibreSSL / BoringSSL (HTTPS)
+//
+// SSL_write / SSL_read operate on plaintext above the TLS layer, so we can
+// capture the decrypted HTTP traffic. SSL_free cleans up on connection close.
+//
+// The IN_HOOK guard prevents double-capture: when SSL_write internally calls
+// send(), the send hook sees IN_HOOK=true and skips.
+// ─────────────────────────────────────────────────────────────────────────────
+
+redhook::hook! {
+    unsafe fn SSL_write(
+        ssl: *mut c_void,
+        buf: *const c_void,
+        num: c_int
+    ) -> c_int => phantom_ssl_write {
+        let result = unsafe { redhook::real!(SSL_write)(ssl, buf, num) };
+        if result > 0 {
+            IN_HOOK.with(|g| {
+                if !g.get() {
+                    g.set(true);
+                    // SAFETY: buf points to `result` bytes that were written successfully.
+                    let data = unsafe { std::slice::from_raw_parts(buf as *const u8, result as usize) };
+                    process_outgoing(ssl as usize, data, true);
+                    g.set(false);
+                }
+            });
+        }
+        result
+    }
+}
+
+redhook::hook! {
+    unsafe fn SSL_read(
+        ssl: *mut c_void,
+        buf: *mut c_void,
+        num: c_int
+    ) -> c_int => phantom_ssl_read {
+        let result = unsafe { redhook::real!(SSL_read)(ssl, buf, num) };
+        if result > 0 {
+            IN_HOOK.with(|g| {
+                if !g.get() {
+                    g.set(true);
+                    // SAFETY: buf holds `result` decrypted bytes from SSL_read.
+                    let data = unsafe { std::slice::from_raw_parts(buf as *const u8, result as usize) };
+                    process_incoming(ssl as usize, data);
+                    g.set(false);
+                }
+            });
+        }
+        result
+    }
+}
+
+redhook::hook! {
+    unsafe fn SSL_free(ssl: *mut c_void) => phantom_ssl_free {
+        // Emit any buffered partial response before freeing the SSL context.
+        IN_HOOK.with(|g| {
+            if !g.get() {
+                g.set(true);
+                process_teardown(ssl as usize);
+                g.set(false);
+            }
+        });
+        // SAFETY: delegating to the real SSL_free.
+        unsafe { redhook::real!(SSL_free)(ssl) }
     }
 }

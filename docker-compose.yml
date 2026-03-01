@@ -72,7 +72,8 @@ services:
       - --
       - curl
       - -s
-      - http://httpbin.org/get
+      - --http1.1
+      - https://httpbin.org/get
 
   # ── Custom / interactive shell ──────────────────────────────────────────────
   # Drop into a bash shell inside the runtime image for manual testing.
