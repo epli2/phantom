@@ -62,10 +62,14 @@ RUN cargo build -p phantom -p phantom-agent
 FROM debian:bookworm-slim AS runtime
 
 # curl is used by the default test command inside the container.
+# jq, ncat, openssl are used by integration tests.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
+        jq \
+        ncat \
+        openssl \
  && rm -rf /var/lib/apt/lists/*
 
 # phantom binary
@@ -75,6 +79,9 @@ COPY --from=builder /build/target/debug/libphantom_agent.so  /usr/local/lib/libp
 
 ENV PHANTOM_DATA_DIR=/data
 RUN mkdir -p /data
+
+# Integration test scripts
+COPY tests/integration/ /tests/integration/
 
 ENTRYPOINT ["/usr/local/bin/phantom"]
 CMD ["--help"]

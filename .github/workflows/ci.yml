@@ -45,3 +45,19 @@ jobs:
 
     - name: Run tests
       run: cargo test --workspace --all-targets --all-features
+
+  integration_test:
+    name: Integration Tests (Linux LD_PRELOAD)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Docker image
+      run: docker compose build
+
+    - name: Run integration tests
+      run: docker compose run --rm test-integration

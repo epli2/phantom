@@ -75,6 +75,19 @@ services:
       - --http1.1
       - https://httpbin.org/get
 
+  # ── Integration test suite ─────────────────────────────────────────────────
+  # Runs all LD_PRELOAD agent integration tests (HTTP + HTTPS) using local
+  # mock servers. No network access required; exits with 0 on success.
+  #
+  # Usage:
+  #   docker compose run --rm test-integration
+  #
+  test-integration:
+    build: .
+    image: phantom-dev:latest
+    entrypoint: /bin/bash
+    command: ["/tests/integration/run_tests.sh"]
+
   # ── Custom / interactive shell ──────────────────────────────────────────────
   # Drop into a bash shell inside the runtime image for manual testing.
   #

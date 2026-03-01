@@ -22,6 +22,7 @@ help:
 	@echo "  make docker-test-ldpreload  Test LD_PRELOAD backend — interactive TUI"
 	@echo "  make docker-test-proxy      Test MITM proxy backend (port 8080) — interactive TUI"
 	@echo "  make docker-test-jsonl      Test LD_PRELOAD backend — JSONL stdout (non-interactive)"
+	@echo "  make docker-test-integration  Run integration test suite (HTTP + HTTPS, local mock servers)"
 	@echo "  make docker-shell           Drop into a bash shell inside the image"
 	@echo "  make docker-clean           Remove the built Docker image"
 	@echo ""
@@ -93,6 +94,13 @@ docker-test-proxy: docker-build
 ##   make test-jsonl | jq .   # pretty-print via jq
 docker-test-jsonl: docker-build
 	docker compose run --rm test-jsonl
+
+## Run the integration test suite (HTTP + HTTPS) inside a Linux container.
+##
+## All tests use local ncat mock servers — no network access required.
+## Exits with 0 on success, 1 on failure.
+docker-test-integration: docker-build
+	docker compose run --rm test-integration
 
 ## Open a bash shell inside the runtime image for manual exploration.
 ##
