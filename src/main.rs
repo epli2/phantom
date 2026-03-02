@@ -5,9 +5,10 @@ use std::time::UNIX_EPOCH;
 use clap::{Parser, ValueEnum};
 use phantom_capture::ProxyCaptureBackend;
 use phantom_core::capture::CaptureBackend;
+use phantom_core::mysql::{MysqlStore, MysqlTrace};
 use phantom_core::storage::TraceStore;
 use phantom_core::trace::HttpTrace;
-use phantom_storage::FjallTraceStore;
+use phantom_storage::{FjallMysqlStore, FjallTraceStore};
 use serde::Serialize;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,6 +150,43 @@ fn trace_to_jsonl(t: &HttpTrace) -> JsonlTrace {
     }
 }
 
+/// Serializable representation of a MySQL trace for JSONL output.
+#[derive(Serialize)]
+struct JsonlMysqlTrace {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    timestamp_ms: u64,
+    duration_ms: u64,
+    query: String,
+    response: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dest_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    db_name: Option<String>,
+    trace_id: String,
+    span_id: String,
+}
+
+fn mysql_trace_to_jsonl(t: &MysqlTrace) -> JsonlMysqlTrace {
+    let timestamp_ms = t
+        .timestamp
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let response = serde_json::to_value(&t.response).unwrap_or(serde_json::Value::Null);
+    JsonlMysqlTrace {
+        kind: "mysql",
+        timestamp_ms,
+        duration_ms: t.duration.as_millis() as u64,
+        query: t.query.clone(),
+        response,
+        dest_addr: t.dest_addr.clone(),
+        db_name: t.db_name.clone(),
+        trace_id: t.trace_id.to_string(),
+        span_id: t.span_id.to_string(),
+    }
+}
+
 /// Runs the JSONL output loop: each captured trace is serialized and written to
 /// stdout as a single JSON object followed by a newline.
 ///
@@ -158,7 +196,9 @@ fn trace_to_jsonl(t: &HttpTrace) -> JsonlTrace {
 /// - The optional `child` process exits (ldpreload mode).
 async fn run_jsonl_output(
     store: Arc<FjallTraceStore>,
+    mysql_store: Arc<FjallMysqlStore>,
     mut trace_rx: tokio::sync::mpsc::Receiver<HttpTrace>,
+    mut mysql_rx: tokio::sync::mpsc::Receiver<MysqlTrace>,
     child: Option<std::process::Child>,
 ) -> anyhow::Result<()> {
     // Spawn a background thread to wait() on the child so we don't block the
@@ -188,6 +228,15 @@ async fn run_jsonl_output(
                     None => break,
                 }
             }
+            maybe_mysql = mysql_rx.recv() => {
+                match maybe_mysql {
+                    Some(t) => {
+                        mysql_store.insert(&t).ok();
+                        println!("{}", serde_json::to_string(&mysql_trace_to_jsonl(&t))?);
+                    }
+                    None => break,
+                }
+            }
             _ = &mut ctrl_c => break,
             // When the child exits, wait briefly for the backend to flush any
             // in-flight datagrams, then drain whatever arrived.
@@ -202,6 +251,10 @@ async fn run_jsonl_output(
                 while let Ok(t) = trace_rx.try_recv() {
                     store.insert(&t).ok();
                     println!("{}", serde_json::to_string(&trace_to_jsonl(&t))?);
+                }
+                while let Ok(t) = mysql_rx.try_recv() {
+                    mysql_store.insert(&t).ok();
+                    println!("{}", serde_json::to_string(&mysql_trace_to_jsonl(&t))?);
                 }
                 break;
             }
@@ -230,11 +283,12 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&data_dir)?;
 
     let store = Arc::new(FjallTraceStore::open(&data_dir)?);
+    let mysql_store = Arc::new(FjallMysqlStore::open(&data_dir)?);
 
     match cli.backend {
-        Backend::Proxy => run_proxy(cli, store).await,
+        Backend::Proxy => run_proxy(cli, store, mysql_store).await,
         #[cfg(target_os = "linux")]
-        Backend::Ldpreload => run_ldpreload(cli, store).await,
+        Backend::Ldpreload => run_ldpreload(cli, store, mysql_store).await,
     }
 }
 
@@ -242,10 +296,16 @@ async fn main() -> anyhow::Result<()> {
 // Proxy backend
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
+async fn run_proxy(
+    cli: Cli,
+    store: Arc<FjallTraceStore>,
+    mysql_store: Arc<FjallMysqlStore>,
+) -> anyhow::Result<()> {
     let mut backend = ProxyCaptureBackend::new(cli.port);
     let backend_name = backend.name().to_string();
     let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Proxy backend does not capture MySQL — provide a never-sending dummy channel.
+    let (_mysql_tx, mysql_rx) = tokio::sync::mpsc::channel::<MysqlTrace>(1);
 
     match cli.output {
         OutputMode::Tui => {
@@ -259,14 +319,14 @@ async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> 
                 "phantom: traces stored in {}",
                 store_path_display(&cli.data_dir)
             );
-            phantom_tui::run_tui(store, trace_rx, &backend_name).await?;
+            phantom_tui::run_tui(store, mysql_store, trace_rx, mysql_rx, &backend_name).await?;
         }
         OutputMode::Jsonl => {
             eprintln!(
                 "phantom: proxy listening on 127.0.0.1:{} [jsonl mode]",
                 cli.port
             );
-            run_jsonl_output(store, trace_rx, None).await?;
+            run_jsonl_output(store, mysql_store, trace_rx, mysql_rx, None).await?;
         }
     }
 
@@ -279,7 +339,11 @@ async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> 
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
-async fn run_ldpreload(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
+async fn run_ldpreload(
+    cli: Cli,
+    store: Arc<FjallTraceStore>,
+    mysql_store: Arc<FjallMysqlStore>,
+) -> anyhow::Result<()> {
     use phantom_capture::LdPreloadCaptureBackend;
 
     let agent_lib = cli.agent_lib.clone().ok_or_else(|| {
@@ -307,7 +371,10 @@ async fn run_ldpreload(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<
 
     let mut backend = LdPreloadCaptureBackend::new(socket_path.clone());
     let backend_name = backend.name().to_string();
-    let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Use start_mysql_aware() to get both HTTP and MySQL channels.
+    let (trace_rx, mysql_rx) = backend
+        .start_mysql_aware()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     eprintln!("phantom: ldpreload backend active");
     eprintln!("  agent lib : {}", agent_lib.display());
@@ -331,11 +398,11 @@ async fn run_ldpreload(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<
     match cli.output {
         OutputMode::Tui => {
             // In TUI mode the user quits manually; child runs in background.
-            phantom_tui::run_tui(store, trace_rx, &backend_name).await?;
+            phantom_tui::run_tui(store, mysql_store, trace_rx, mysql_rx, &backend_name).await?;
         }
         OutputMode::Jsonl => {
             // In JSONL mode we exit automatically when the child finishes.
-            run_jsonl_output(store, trace_rx, Some(child)).await?;
+            run_jsonl_output(store, mysql_store, trace_rx, mysql_rx, Some(child)).await?;
         }
     }
 
