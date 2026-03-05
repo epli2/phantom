@@ -1,19 +1,23 @@
 # Phantom — Agent Instructions
 
-Phantom is a Rust-based API observability tool that captures HTTP/HTTPS traffic via a MITM proxy (or LD_PRELOAD agent on Linux) and presents it in a terminal UI. It is organized as a Cargo workspace of five library crates plus one binary.
+Phantom is a Rust-based API observability tool that captures HTTP/HTTPS traffic via a MITM proxy (or LD_PRELOAD agent on Linux) and presents it in a terminal UI or streams it as JSON Lines. It is organized as a Cargo workspace of five library crates plus one binary.
 
 ---
 
 ## Project Layout
 
 ```
-src/main.rs                  # Binary entry point: CLI parsing, component wiring
+src/main.rs                  # Binary entry point: CLI parsing, component wiring, child-process spawning
 crates/
   phantom-core/              # Domain types, traits, error types — no I/O
   phantom-storage/           # Fjall LSM-tree TraceStore implementation
   phantom-capture/           # Hudsucker MITM proxy + LD_PRELOAD (Linux) CaptureBackend
   phantom-tui/               # Ratatui terminal UI
   phantom-agent/             # LD_PRELOAD dylib (Linux only, hooks libc send/recv)
+tests/
+  proxy_node_integration.rs  # Integration tests: Node.js proxy capture (HTTP + HTTPS)
+  apps/node-app/             # Test Node.js app (client.js, client-alts.js, proxy-preload.js)
+  integration/               # Shell-based integration tests
 Cargo.toml                   # Workspace root + binary crate
 plan.md                      # Japanese-language technical design document
 ```
@@ -38,6 +42,8 @@ cargo build --workspace --all-targets --all-features  # Full build (matches CI)
 cargo build --release                # Release build
 cargo run                            # Run proxy on default port 8080
 cargo run -- --port 9090             # Run with custom port
+cargo run -- -- node app.js          # Trace a Node.js app (proxy-preload.js auto-injected)
+cargo run -- --output jsonl -- node app.js  # Stream JSONL and exit when child exits
 cargo run -- --backend ldpreload --agent-lib ./target/debug/libphantom_agent.so -- curl http://example.com
 cargo check                          # Fast type/borrow check (no codegen)
 cargo clippy --workspace --all-targets --all-features -- -D warnings  # Lint (CI-exact)
@@ -60,12 +66,64 @@ make check    # fmt + clippy + build + test (full CI locally)
 
 | Flag | Default | Description |
 |---|---|---|
-| `-b, --backend <BACKEND>` | `proxy` | `proxy` or `ldpreload` (Linux only) |
-| `-o, --output <OUTPUT>` | `tui` | `tui` (interactive) or `jsonl` (stdout stream) |
+| `-b, --backend <BACKEND>` | `proxy` | `proxy` (MITM, cross-platform) or `ldpreload` (Linux only) |
+| `-o, --output <OUTPUT>` | `tui` | `tui` (interactive) or `jsonl` (stdout stream, auto-exits with child) |
 | `-p, --port <PORT>` | `8080` | Proxy capture port |
+| `--insecure` | off | Disable TLS verification for backend servers (self-signed certs) |
 | `-d, --data-dir <DIR>` | `~/.local/share/phantom/data` | Storage directory |
 | `--agent-lib <PATH>` | — | Path to `libphantom_agent.so` (ldpreload backend) |
-| `-- <CMD>` | — | Command to run with LD_PRELOAD injected |
+| `-- <CMD>` | — | Command to spawn and trace automatically |
+
+---
+
+## Node.js Transparent Proxy Injection
+
+When the command after `--` is `node` or `nodejs`, phantom automatically:
+
+1. Writes `proxy-preload.js` (embedded via `include_str!`) to a temp file.
+2. Prepends `--require <tempfile>` to the Node arguments.
+3. Sets `HTTP_PROXY` / `http_proxy` to `http://127.0.0.1:<PORT>`.
+4. Deletes the temp file after the child exits (`TempScript` RAII guard).
+
+`proxy-preload.js` monkey-patches Node's `http`, `https`, and `undici` modules so that **all** outbound requests (including HTTPS) go through the phantom MITM proxy with zero application changes.
+
+### HTTP client support in proxy-preload.js
+
+| Client | Mechanism | HTTP | HTTPS |
+|--------|-----------|------|-------|
+| `http.request` / `http.get` | Rewritten to absolute URI targeting proxy | ✅ | — |
+| `https.request` / `https.get` | Custom `ProxyTunnelAgent` (CONNECT + TLS MITM) | — | ✅ |
+| `axios` (npm) | Uses `http`/`https` internally → patched automatically | ✅ | ✅ |
+| `undici.request()` | `setGlobalDispatcher(new ProxyAgent(...))` | ✅ | ✅ |
+| `globalThis.fetch` HTTP | Patched to route `http://` via `http.request` (bypasses CONNECT) | ✅ | — |
+| `globalThis.fetch` HTTPS | Handled by undici ProxyAgent (CONNECT → MITM) | — | ✅ |
+
+**Double-proxy guard**: axios auto-reads `HTTP_PROXY` and formats an absolute-URI request. The `http.request` patch detects this (absolute URI path + target == proxy host:port) and skips re-wrapping.
+
+**fetch HTTP CONNECT issue**: undici's `ProxyAgent` uses `CONNECT` for all `fetch()` requests. Phantom handles `CONNECT` as HTTPS MITM, which breaks plain HTTP. Fix: `proxy-preload.js` patches `globalThis.fetch` to intercept `http://` URLs and route them through `http.request` directly.
+
+---
+
+## JSONL Output Schema
+
+When `--output jsonl` is used, one JSON object is written per line to stdout. All fields are always present unless marked optional.
+
+| Field | Type | Description |
+|---|---|---|
+| `trace_id` | string | W3C-compatible 128-bit trace ID (hex, 32 chars) |
+| `span_id` | string | 64-bit span ID (hex, 16 chars) |
+| `timestamp_ms` | number | Unix epoch milliseconds — request start time |
+| `duration_ms` | number | Round-trip latency in milliseconds |
+| `method` | string | HTTP verb: `"GET"`, `"POST"`, `"PUT"`, `"DELETE"`, … |
+| `url` | string | Full request URL (scheme + host + path + query) |
+| `status_code` | number | HTTP response status code |
+| `protocol_version` | string | HTTP version string, e.g. `"HTTP/1.1"` |
+| `request_headers` | object | Lower-cased header names → values |
+| `response_headers` | object | Lower-cased header names → values |
+| `request_body` | string? | UTF-8 decoded body; omitted when empty |
+| `response_body` | string? | UTF-8 decoded body; omitted when empty |
+| `source_addr` | string? | Client socket address, e.g. `"127.0.0.1:54321"` |
+| `dest_addr` | string? | Server socket address, e.g. `"93.184.216.34:443"` |
 
 ---
 
@@ -87,7 +145,32 @@ cargo test -p phantom-core
 cargo test -p phantom-tui
 ```
 
-### Run a Single Test Function
+### Run a Specific Integration Test
+
+```sh
+# Node.js proxy integration tests (requires node + npm in PATH)
+cargo test --test proxy_node_integration -- --nocapture
+
+# Single test function:
+cargo test --test proxy_node_integration test_proxy_captures_node_app_traffic -- --nocapture
+cargo test --test proxy_node_integration test_proxy_captures_alternative_http_clients -- --nocapture
+```
+
+### Node.js Integration Tests (`tests/proxy_node_integration.rs`)
+
+| Test | Description |
+|------|-------------|
+| `test_proxy_captures_node_app_traffic` | HTTP + HTTPS GET/POST via `http`/`https` modules (4 traces) |
+| `test_proxy_captures_alternative_http_clients` | axios, undici, fetch — HTTP + HTTPS × 3 clients (6 traces) |
+
+Both tests:
+- Auto-skip if `node` or `npm` is not in `PATH`.
+- Start in-process Rust mock backends (HTTP + HTTPS with self-signed cert).
+- Run `phantom --output jsonl --insecure -- node <script>.js`.
+- Parse JSONL output and assert method, path, status code per trace.
+- Identify traces by `x-phantom-client` custom header in `request_headers`.
+
+### Run a Single Unit Test Function
 
 ```sh
 # By substring match (simplest):
@@ -223,7 +306,12 @@ pub enum StorageError {
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | CLI parsing (`clap` derive), backend/output mode selection, component wiring |
+| `src/main.rs` | CLI parsing (`clap` derive), backend/output mode selection, child-process spawning, JSONL output loop |
+| `tests/proxy_node_integration.rs` | Integration tests: Node.js proxy capture, alternative HTTP client tracing |
+| `tests/apps/node-app/proxy-preload.js` | Node.js `--require` preload: patches `http`, `https`, `undici`, `fetch` to go through proxy |
+| `tests/apps/node-app/client.js` | Test client: `http`/`https` module usage (basic integration test) |
+| `tests/apps/node-app/client-alts.js` | Test client: `axios`, `undici`, `globalThis.fetch` (alternative HTTP clients test) |
+| `tests/apps/node-app/package.json` | Node app deps: `axios ^1.7`, `undici ^7` |
 | `crates/phantom-core/src/trace.rs` | `HttpTrace`, `TraceId`, `SpanId`, `HttpMethod` |
 | `crates/phantom-core/src/storage.rs` | `TraceStore` trait |
 | `crates/phantom-core/src/capture.rs` | `CaptureBackend` trait |
@@ -250,6 +338,12 @@ HTTP traffic
   → fjall_store.rs FjallTraceStore::insert()  # batch write: traces + by_time + by_trace_id
   → app.rs App::add_trace()                   # prepends to traces Vec, bumps count
   → ui.rs render()                            # pure read of App state, no mutation
+
+Node.js auto-injection (proxy mode, -- node app.js):
+  → main.rs spawn_proxy_child()               # writes proxy-preload.js to /tmp, prepends --require
+  → proxy-preload.js loaded by Node at startup
+  → patches http.request, https.request, undici dispatcher, globalThis.fetch
+  → all outbound Node requests → phantom MITM proxy
 
 LD_PRELOAD flow (Linux only):
   → phantom-agent dylib hooks send()/recv()   # intercepts plain-text HTTP/1.x
