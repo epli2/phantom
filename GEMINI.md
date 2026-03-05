@@ -6,65 +6,84 @@ Phantom is a next-generation API observability and automatic workflow generation
 
 ### Building and Running
 - **Build the project:** `cargo build`
-- **Run with Proxy (default):** `cargo run` (Proxy on port 8080)
+- **Run with Proxy (default):** `phantom -- <COMMAND>` (e.g., `phantom -- node app.js`)
 - **Run with LD_PRELOAD (Linux only):**
   `cargo run -- --backend ldpreload --agent-lib ./target/debug/libphantom_agent.so -- curl http://example.com`
-- **Run in JSONL mode:** `cargo run -- --output jsonl`
+- **Run in JSONL mode:** `phantom --output jsonl -- <COMMAND>`
 - **Run tests:** `cargo test`
 
-### CLI Options
-- `-b, --backend <BACKEND>`: Capture backend to use (`proxy` or `ldpreload`).
-- `-o, --output <MODE>`: Output mode (`tui` or `jsonl`).
-- `-p, --port <PORT>`: Port for the proxy backend (default: 8080).
-- `-d, --data-dir <DIR>`: Directory for trace storage (default: `~/.local/share/phantom/data`).
+### Common Examples
+- **Trace a Node.js app (HTTP + HTTPS captured automatically):**
+  `phantom -- node app.js`
+- **Stream traces to jq for filtering:**
+  `phantom --output jsonl -- node app.js | jq 'select(.status_code >= 400)'`
+- **Capture plain HTTP for any command:**
+  `phantom -- curl http://api.example.com/v1/users`
+
+## 🛠 CLI Options
+- `-b, --backend <BACKEND>`: Capture backend to use (`proxy` or `ldpreload`). Default: `proxy`.
+- `-o, --output <MODE>`: Output mode (`tui` or `jsonl`). Default: `tui`.
+- `-p, --port <PORT>`: Port for the proxy backend. Default: `8080`.
+- `--insecure`: Disable TLS certificate verification for backend connections.
+- `-d, --data-dir <DIR>`: Directory for trace storage. Default: `~/.local/share/phantom/data`.
 - `--agent-lib <PATH>`: Path to `libphantom_agent.so` (required for `ldpreload`).
-- `-- <COMMAND>`: The command to run with `LD_PRELOAD` injected.
+- `-- <COMMAND>`: The command to run with interception injected.
+
+### JSONL Output Schema
+When using `--output jsonl`, each line is a JSON object with:
+- `trace_id`: W3C-compatible 128-bit trace ID (hex).
+- `span_id`: 64-bit span ID (hex).
+- `timestamp_ms`: Unix epoch milliseconds.
+- `duration_ms`: Round-trip latency in ms.
+- `method`: HTTP verb (GET, POST, etc.).
+- `url`: Full request URL.
+- `status_code`: HTTP response status.
+- `protocol_version`: e.g., "HTTP/1.1".
+- `request_headers` / `response_headers`: Header maps.
+- `request_body` / `response_body`: UTF-8 decoded bodies (optional).
 
 ## 🏗 Architecture & Tech Stack
 
-The project is organized as a Rust workspace with the following crates:
+The project is organized as a Rust workspace:
 
-- **`phantom-core`**: Defines core traits (`TraceStore`, `CaptureBackend`), data structures (`HttpTrace`), and error types.
-- **`phantom-storage`**: Implements `TraceStore` using **Fjall**, a high-performance LSM-tree storage engine.
+- **`phantom-core`**: Defines core traits (`TraceStore`, `CaptureBackend`) and `HttpTrace`.
+- **`phantom-storage`**: Implements `TraceStore` using **Fjall** (LSM-tree).
 - **`phantom-capture`**: Implements `CaptureBackend`.
     - **ProxyBackend**: MITM HTTPS interception using `hudsucker`.
-    - **LdPreloadBackend**: Receives traces from the `phantom-agent` via Unix Domain Sockets.
-- **`phantom-agent`**: A Linux-only `LD_PRELOAD` shared library that hooks `libc` functions (`send`, `recv`, `close`) to capture plain-text HTTP traffic.
-- **`phantom-tui`**: Terminal user interface using **Ratatui**.
+    - **Node.js Integration**: Automatically injects `proxy-preload.js` via `--require` to capture HTTPS without code changes.
+    - **LdPreloadBackend**: Receives traces from `phantom-agent` via Unix Domain Sockets.
+- **`phantom-agent`**: Linux-only `LD_PRELOAD` library hooking `libc` `send`/`recv`.
+- **`phantom-tui`**: Interactive UI using **Ratatui**.
 
 ### Key Technologies
 - **Async Runtime:** `tokio`
-- **Storage Engine:** `fjall`
-- **TUI Framework:** `ratatui`
+- **Storage:** `fjall` (LSM-tree with key-value separation).
+- **TUI:** `ratatui`
 - **Proxy/MITM:** `hudsucker`
-- **LD_PRELOAD Hooking:** `redhook`
 - **Serialization:** `serde`, `serde_json`
-- **Trace Context:** W3C Trace Context compatible (128-bit Trace ID, 64-bit Span ID).
 
 ## 🛠 Development Conventions
 
 ### Coding Style
-- Follow standard Rust idioms and `clippy` suggestions.
-- Use `anyhow` for application-level error handling and `thiserror` for library-level errors.
-- Prefer `Arc<dyn Trait>` for sharing state between components.
+- Use `anyhow` for applications, `thiserror` for libraries.
+- Prefer `Arc<dyn Trait>` for component sharing.
+- Follow standard Rust idioms and `clippy`.
 
 ### Testing
-- `phantom-storage` uses `tempfile` for testing LSM-tree operations.
-- Ensure all tests pass before submitting changes: `cargo test`.
+- `phantom-storage` uses `tempfile` for disk-based tests.
+- **Integration Tests:** `tests/proxy_node_integration.rs` verifies the Node.js proxy injection.
+- Run all tests: `cargo test`.
 
 ### Project Roadmap (from `plan.md`)
-- **Userspace eBPF:** Integration with `bpftime` for zero-instrumentation capture without kernel overhead.
-- **Workflow Inference:** Automatic generation of **Arazzo Specification** and **OpenAPI Spec** using **LLM** (`candle`) and semantic analysis.
-- **GUI:** Potential future integration with `Tauri`.
+- **Userspace eBPF:** Integration with `bpftime` for zero-instrumentation capture (10x faster than uprobes).
+- **Workflow Inference:** Automatic generation of **Arazzo Specification** using **LLM** (`candle`) and semantic value correlation.
+- **GUI:** Cross-platform desktop interface using **Tauri**.
 
 ## 📂 Key Files
-- `src/main.rs`: Entry point, CLI parsing, and component wiring.
+- `src/main.rs`: CLI entry point and process spawning logic.
 - `crates/phantom-core/src/trace.rs`: `HttpTrace` definition.
-- `crates/phantom-core/src/capture.rs`: `CaptureBackend` trait.
-- `crates/phantom-core/src/storage.rs`: `TraceStore` trait.
 - `crates/phantom-storage/src/fjall_store.rs`: Primary storage implementation.
 - `crates/phantom-capture/src/proxy.rs`: Proxy-based interception logic.
-- `crates/phantom-capture/src/ldpreload.rs`: `LD_PRELOAD` backend listener.
 - `crates/phantom-agent/src/lib.rs`: The `LD_PRELOAD` injection agent.
-- `crates/phantom-tui/src/lib.rs`: TUI entry point.
-- `plan.md`: Comprehensive technical design and research document.
+- `tests/proxy_node_integration.rs`: Node.js integration test suite.
+- `plan.md`: Comprehensive technical design (Japanese).
