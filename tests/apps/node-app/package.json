@@ -1,0 +1,6 @@
+{
+  "name": "phantom-test-app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Test Node.js app for phantom proxy integration tests (no external dependencies)"
+}

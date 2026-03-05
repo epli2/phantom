@@ -52,6 +52,10 @@ struct Cli {
     #[arg(short, long, default_value = "8080")]
     port: u16,
 
+    /// Skip TLS certificate verification for backend connections (testing only).
+    #[arg(long, default_value = "false")]
+    insecure: bool,
+
     /// Directory for trace storage.
     #[arg(short, long)]
     data_dir: Option<PathBuf>,
@@ -243,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
-    let mut backend = ProxyCaptureBackend::new(cli.port);
+    let mut backend = ProxyCaptureBackend::new(cli.port, cli.insecure);
     let backend_name = backend.name().to_string();
     let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 

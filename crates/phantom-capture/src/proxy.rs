@@ -18,14 +18,16 @@ const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 pub struct ProxyCaptureBackend {
     listen_port: u16,
+    insecure: bool,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ProxyCaptureBackend {
-    pub fn new(listen_port: u16) -> Self {
+    pub fn new(listen_port: u16, insecure: bool) -> Self {
         Self {
             listen_port,
+            insecure,
             shutdown_tx: None,
             task_handle: None,
         }
@@ -43,6 +45,7 @@ impl CaptureBackend for ProxyCaptureBackend {
         };
 
         let port = self.listen_port;
+        let insecure = self.insecure;
 
         let task_handle = tokio::spawn(async move {
             let (key_pair, ca_cert) = generate_ca();
@@ -51,18 +54,34 @@ impl CaptureBackend for ProxyCaptureBackend {
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
             info!("Starting proxy on {addr}");
 
-            let proxy = Proxy::builder()
-                .with_addr(addr)
-                .with_rustls_client()
-                .with_ca(ca)
-                .with_http_handler(handler)
-                .with_graceful_shutdown(async {
-                    shutdown_rx.await.ok();
-                })
-                .build();
-
-            if let Err(e) = proxy.start().await {
-                warn!("Proxy error: {e}");
+            if insecure {
+                info!("TLS verification disabled (--insecure)");
+                let client = build_insecure_client();
+                let proxy = Proxy::builder()
+                    .with_addr(addr)
+                    .with_client(client)
+                    .with_ca(ca)
+                    .with_http_handler(handler)
+                    .with_graceful_shutdown(async {
+                        shutdown_rx.await.ok();
+                    })
+                    .build();
+                if let Err(e) = proxy.start().await {
+                    warn!("Proxy error: {e}");
+                }
+            } else {
+                let proxy = Proxy::builder()
+                    .with_addr(addr)
+                    .with_rustls_client()
+                    .with_ca(ca)
+                    .with_http_handler(handler)
+                    .with_graceful_shutdown(async {
+                        shutdown_rx.await.ok();
+                    })
+                    .build();
+                if let Err(e) = proxy.start().await {
+                    warn!("Proxy error: {e}");
+                }
             }
         });
 
@@ -272,4 +291,78 @@ fn rand_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
     buf.iter_mut().for_each(|b| *b = rand::random());
     buf
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Insecure TLS client (--insecure mode)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a hyper client that skips all TLS certificate verification.
+/// Used with `--insecure` for testing against backends with self-signed certs.
+fn build_insecure_client() -> hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    Body,
+> {
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(NoCertVerifier))
+        .with_no_client_auth();
+
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_http1()
+        .build();
+
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(https)
+}
+
+/// A [`rustls::client::danger::ServerCertVerifier`] that accepts any certificate.
+/// For testing only — never use in production.
+#[derive(Debug)]
+struct NoCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+        ]
+    }
 }
