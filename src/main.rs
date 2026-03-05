@@ -24,71 +24,160 @@ const NODE_PROXY_PRELOAD: &str = include_str!("../tests/apps/node-app/proxy-prel
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Backend {
-    /// MITM HTTP/HTTPS proxy (cross-platform, requires `http_proxy` env var).
+    /// MITM proxy — captures HTTP + HTTPS, cross-platform. Node.js HTTPS injected automatically.
     Proxy,
-    /// LD_PRELOAD agent injected into a target process (Linux only).
+    /// LD_PRELOAD agent — plain HTTP only, Linux only. No proxy config needed.
     #[cfg(target_os = "linux")]
     Ldpreload,
 }
 
 #[derive(Debug, Clone, Default, ValueEnum)]
 enum OutputMode {
-    /// Interactive TUI (default).
+    /// Interactive terminal UI with trace list and detail view.
     #[default]
     Tui,
-    /// Stream captured traces as JSON Lines to stdout (one object per line).
-    /// Useful for scripting and AI-driven workflows.
+    /// Stream traces as JSON Lines to stdout; auto-exits when child process finishes.
     Jsonl,
 }
 
 #[derive(Parser)]
 #[command(
     name = "phantom",
-    about = "Zero-instrumentation API observability",
+    about = "Zero-instrumentation HTTP/HTTPS API observability tool",
+    long_about = "phantom — Zero-instrumentation HTTP/HTTPS API observability\n\
+\n\
+Captures every HTTP and HTTPS request/response made by a target process\n\
+and displays them in an interactive TUI or streams them as JSON Lines.\n\
+The target application requires NO code changes.\n\
+\n\
+━━━ CAPTURE BACKENDS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+\n\
+  proxy  (default, cross-platform)\n\
+    Starts a MITM proxy on 127.0.0.1:<PORT>.  Intercepts HTTP and HTTPS.\n\
+\n\
+    • Node.js  (`phantom -- node app.js`)\n\
+      proxy-preload.js is injected automatically via --require.  Both http://\n\
+      and https:// are captured with zero application changes.\n\
+\n\
+    • Other commands  (`phantom -- curl http://api.example.com/v1`)\n\
+      HTTP_PROXY / http_proxy is set automatically.  Plain HTTP is captured.\n\
+      HTTPS requires the application to honour HTTP_PROXY CONNECT tunnelling.\n\
+\n\
+    • Manual  (start phantom alone, then configure your app)\n\
+      Set HTTP_PROXY=http://127.0.0.1:8080 in the target process yourself.\n\
+\n\
+  ldpreload  (Linux only)\n\
+    Injects libphantom_agent.so via LD_PRELOAD.  Hooks send/recv/close at\n\
+    the libc level.  No proxy configuration required.  Plain HTTP only\n\
+    (HTTPS traffic is already encrypted at the socket layer).\n\
+\n\
+━━━ OUTPUT MODES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+\n\
+  tui   (default) — Interactive terminal UI with trace list + detail view.\n\
+\n\
+  jsonl — One JSON object per line on stdout.  phantom exits automatically\n\
+          when the child process exits (ideal for scripting and AI agents).\n\
+\n\
+  JSONL record schema (all fields always present unless marked optional):\n\
+    trace_id          string   W3C-compatible 128-bit trace ID (hex, 32 chars)\n\
+    span_id           string   64-bit span ID (hex, 16 chars)\n\
+    timestamp_ms      number   Unix epoch milliseconds — request start time\n\
+    duration_ms       number   Round-trip latency in milliseconds\n\
+    method            string   HTTP verb: \"GET\", \"POST\", \"PUT\", \"DELETE\", …\n\
+    url               string   Full request URL (scheme + host + path + query)\n\
+    status_code       number   HTTP response status code (200, 404, 500, …)\n\
+    protocol_version  string   HTTP version string, e.g. \"HTTP/1.1\"\n\
+    request_headers   object   Lower-cased header names → values\n\
+    response_headers  object   Lower-cased header names → values\n\
+    request_body      string?  UTF-8 decoded body; omitted when empty\n\
+    response_body     string?  UTF-8 decoded body; omitted when empty\n\
+    source_addr       string?  Client socket address, e.g. \"127.0.0.1:54321\"\n\
+    dest_addr         string?  Server socket address, e.g. \"93.184.216.34:443\"",
+    after_long_help = "EXAMPLES\n\
+\n\
+  ┌─ Proxy mode (default) ──────────────────────────────────────────────────┐\n\
+\n\
+  # Trace a Node.js app — HTTP + HTTPS captured, zero app changes:\n\
+  phantom -- node app.js\n\
+\n\
+  # Stream traces as JSONL for scripting / AI analysis:\n\
+  phantom --output jsonl -- node app.js\n\
+\n\
+  # Allow self-signed TLS certs on backend servers:\n\
+  phantom --insecure --output jsonl -- node app.js\n\
+\n\
+  # Trace any command (plain HTTP only, HTTPS if app uses HTTP_PROXY CONNECT):\n\
+  phantom -- curl http://api.example.com/v1/users\n\
+\n\
+  # Start proxy only, configure target app manually:\n\
+  phantom\n\
+  # then in another shell:\n\
+  HTTP_PROXY=http://127.0.0.1:8080 node app.js\n\
+\n\
+  # Custom port, custom data directory:\n\
+  phantom --port 9090 --data-dir ./traces -- node app.js\n\
+\n\
+  └─────────────────────────────────────────────────────────────────────────┘\n\
+\n\
+  ┌─ LD_PRELOAD mode (Linux only) ──────────────────────────────────────────┐\n\
+\n\
+  # Build the agent first:\n\
+  cargo build -p phantom-agent\n\
+\n\
+  # Trace a process (plain HTTP only):\n\
+  phantom --backend ldpreload \\\n\
+          --agent-lib ./target/debug/libphantom_agent.so \\\n\
+          -- curl http://api.example.com/v1/users\n\
+\n\
+  └─────────────────────────────────────────────────────────────────────────┘\n\
+\n\
+  ┌─ Consume JSONL from another process ────────────────────────────────────┐\n\
+\n\
+  phantom --output jsonl -- node app.js \\\n\
+    | jq 'select(.status_code >= 400)'          # filter errors\n\
+\n\
+  phantom --output jsonl -- node app.js \\\n\
+    | jq '{method,url,status_code,duration_ms}' # compact summary\n\
+\n\
+  └─────────────────────────────────────────────────────────────────────────┘",
     version
 )]
 struct Cli {
-    /// Capture backend to use.
+    /// Capture backend: 'proxy' (MITM, cross-platform) or 'ldpreload' (Linux, plain HTTP only).
     #[arg(short, long, value_enum, default_value = "proxy")]
     backend: Backend,
 
-    /// Output mode: interactive TUI or JSON Lines stream.
+    /// Output mode: 'tui' opens the interactive UI; 'jsonl' streams one trace
+    /// per line to stdout and exits when the child process finishes.
     #[arg(short, long, value_enum, default_value = "tui")]
     output: OutputMode,
 
-    /// Port for the proxy backend.
+    /// TCP port the proxy listens on.
     #[arg(short, long, default_value = "8080")]
     port: u16,
 
-    /// Skip TLS certificate verification for backend connections (testing only).
+    /// Disable TLS certificate verification for connections to backend servers.
+    /// Use when tracing apps that talk to servers with self-signed certificates.
     #[arg(long, default_value = "false")]
     insecure: bool,
 
-    /// Directory for trace storage.
+    /// Directory where captured traces are persisted (Fjall key-value store).
+    /// Defaults to the platform data directory, e.g. ~/.local/share/phantom/data.
     #[arg(short, long)]
     data_dir: Option<PathBuf>,
 
-    /// Path to libphantom_agent.so (required for --backend ldpreload).
+    /// Path to libphantom_agent.so  [required for --backend ldpreload]
     ///
-    /// Example: ./target/debug/libphantom_agent.so
+    /// Build with: cargo build -p phantom-agent
+    /// Then pass:  --agent-lib ./target/debug/libphantom_agent.so
     #[arg(long, value_name = "PATH")]
     agent_lib: Option<PathBuf>,
 
-    /// Command to spawn and trace.
+    /// Command to spawn and trace (everything after `--`).
     ///
-    /// Everything after `--` is treated as the command.
-    ///
-    /// In proxy mode (`--backend proxy`): the command is launched with
-    /// `HTTP_PROXY` set automatically.  For Node.js commands (`node`/`nodejs`)
-    /// the proxy-preload script is also injected via `--require` so that HTTPS
-    /// is intercepted transparently without any changes to the application.
-    ///
-    /// In ldpreload mode (`--backend ldpreload`): the LD_PRELOAD agent is
-    /// injected into the child process (Linux only).
-    ///
-    /// Examples:
-    ///   `phantom -- node app.js`
-    ///   `phantom --backend ldpreload --agent-lib ./libphantom_agent.so -- curl http://example.com`
+    /// proxy mode:     HTTP_PROXY is set automatically; Node.js additionally
+    ///                 gets proxy-preload.js injected via --require (captures HTTPS too).
+    /// ldpreload mode: LD_PRELOAD + PHANTOM_SOCKET are set automatically.
     #[arg(last = true, value_name = "CMD")]
     command: Vec<String>,
 }
