@@ -322,3 +322,210 @@ fn test_proxy_captures_node_app_traffic() {
 
     eprintln!("All 4 traces (2 HTTP + 2 HTTPS) verified.");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers shared by both tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Return the value of the `x-phantom-client` request header from a JSONL trace.
+fn client_of(t: &serde_json::Value) -> &str {
+    t["request_headers"]["x-phantom-client"]
+        .as_str()
+        .unwrap_or("unknown")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 2: alternative HTTP clients (axios / undici / fetch)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_proxy_captures_alternative_http_clients() {
+    // ── Pre-flight: require node and npm ─────────────────────────────────
+    if Command::new("node")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("SKIP: `node` not found");
+        return;
+    }
+    if Command::new("npm")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("SKIP: `npm` not found");
+        return;
+    }
+
+    let phantom_bin = env!("CARGO_BIN_EXE_phantom");
+    let app_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/apps/node-app");
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+
+    // ── Install npm dependencies (axios) ─────────────────────────────────
+    let npm_status = Command::new("npm")
+        .args(["install", "--prefix"])
+        .arg(&app_dir)
+        .status()
+        .expect("npm install");
+    assert!(npm_status.success(), "npm install failed");
+
+    let http_port = available_port();
+    let https_port = available_port();
+    let proxy_port = available_port();
+
+    // ── Generate self-signed cert ─────────────────────────────────────────
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("generate cert");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+
+    // ── Start Rust mock backends ──────────────────────────────────────────
+    let _http_thread = start_http_backend(http_port);
+    assert!(
+        wait_for_port(http_port, Duration::from_secs(3)),
+        "HTTP backend"
+    );
+
+    let _https_thread = start_https_backend(https_port, cert_der, key_der);
+    assert!(
+        wait_for_port(https_port, Duration::from_secs(3)),
+        "HTTPS backend"
+    );
+
+    // ── Run phantom with `-- node client-alts.js` ─────────────────────────
+    // phantom injects proxy-preload.js (embedded) which patches http, https,
+    // AND undici/fetch via setGlobalDispatcher.
+    let phantom_output = Command::new(phantom_bin)
+        .args([
+            "--backend",
+            "proxy",
+            "--output",
+            "jsonl",
+            "--port",
+            &proxy_port.to_string(),
+            "--insecure",
+            "--data-dir",
+        ])
+        .arg(tmp_dir.path())
+        .arg("--")
+        .arg("node")
+        .arg(app_dir.join("client-alts.js"))
+        .env("BACKEND_HTTP_URL", format!("http://127.0.0.1:{http_port}"))
+        .env(
+            "BACKEND_HTTPS_URL",
+            format!("https://localhost:{https_port}"),
+        )
+        .env("NODE_TLS_REJECT_UNAUTHORIZED", "0")
+        // Point node_modules resolution to the app directory.
+        .env("NODE_PATH", app_dir.join("node_modules"))
+        .output()
+        .expect("run phantom");
+
+    let stdout_buf = String::from_utf8_lossy(&phantom_output.stdout).into_owned();
+    let stderr_buf = String::from_utf8_lossy(&phantom_output.stderr).into_owned();
+
+    assert!(
+        phantom_output.status.success(),
+        "phantom exited non-zero.\n  stdout:\n{stdout_buf}\n  stderr:\n{stderr_buf}"
+    );
+
+    // ── Parse JSONL traces ────────────────────────────────────────────────
+    let traces: Vec<serde_json::Value> = stdout_buf
+        .lines()
+        .filter(|l| l.starts_with('{'))
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+
+    assert_eq!(
+        traces.len(),
+        6,
+        "Expected 6 traces (2 per client × 3 clients: axios/undici/fetch), got {}.\
+         \n  stdout:\n{stdout_buf}\n  stderr:\n{stderr_buf}",
+        traces.len(),
+    );
+
+    // ── axios: HTTP + HTTPS GET /api/health (200) ────────────────────────
+    for scheme in ["http", "https"] {
+        let t = traces
+            .iter()
+            .find(|t| {
+                client_of(t) == "axios"
+                    && t["url"]
+                        .as_str()
+                        .is_some_and(|u| u.starts_with(&format!("{scheme}://")))
+            })
+            .unwrap_or_else(|| panic!("missing axios {scheme}:// trace\n  stdout:\n{stdout_buf}"));
+        assert_eq!(t["method"], "GET", "axios {scheme} method");
+        assert_eq!(t["status_code"], 200, "axios {scheme} status");
+        assert!(
+            t["url"].as_str().is_some_and(|u| u.contains("/api/health")),
+            "axios {scheme} url"
+        );
+    }
+
+    // ── undici: HTTP + HTTPS GET /api/users (200) ────────────────────────
+    for scheme in ["http", "https"] {
+        let t = traces
+            .iter()
+            .find(|t| {
+                client_of(t) == "undici"
+                    && t["url"]
+                        .as_str()
+                        .is_some_and(|u| u.starts_with(&format!("{scheme}://")))
+            })
+            .unwrap_or_else(|| panic!("missing undici {scheme}:// trace\n  stdout:\n{stdout_buf}"));
+        assert_eq!(t["method"], "GET", "undici {scheme} method");
+        assert_eq!(t["status_code"], 200, "undici {scheme} status");
+        assert!(
+            t["url"].as_str().is_some_and(|u| u.contains("/api/users")),
+            "undici {scheme} url"
+        );
+    }
+
+    // ── fetch: HTTP + HTTPS POST /api/users (201) ────────────────────────
+    for scheme in ["http", "https"] {
+        let t = traces
+            .iter()
+            .find(|t| {
+                client_of(t) == "fetch"
+                    && t["url"]
+                        .as_str()
+                        .is_some_and(|u| u.starts_with(&format!("{scheme}://")))
+            })
+            .unwrap_or_else(|| panic!("missing fetch {scheme}:// trace\n  stdout:\n{stdout_buf}"));
+        assert_eq!(t["method"], "POST", "fetch {scheme} method");
+        assert_eq!(t["status_code"], 201, "fetch {scheme} status");
+        assert!(
+            t["request_body"]
+                .as_str()
+                .is_some_and(|b| b.contains("Dave")),
+            "fetch {scheme} request body"
+        );
+    }
+
+    // ── Cross-cutting checks ──────────────────────────────────────────────
+    for (i, t) in traces.iter().enumerate() {
+        assert!(
+            t["trace_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "trace[{i}] trace_id"
+        );
+        assert!(
+            t["span_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "trace[{i}] span_id"
+        );
+        assert!(
+            t["timestamp_ms"].as_u64().is_some_and(|v| v > 0),
+            "trace[{i}] timestamp_ms"
+        );
+    }
+
+    eprintln!(
+        "All 6 traces (axios ×2, undici ×2, fetch ×2) verified. clients: {:?}",
+        traces.iter().map(client_of).collect::<Vec<_>>()
+    );
+}

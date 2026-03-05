@@ -70,8 +70,19 @@ http.request = function (...args) {
   const { options, callback } = normaliseArgs(args);
 
   const host = options.hostname || options.host || "localhost";
-  const port = options.port || 80;
+  const port = Number(options.port) || 80;
   const path = options.path || "/";
+
+  // If this request already has an absolute-URI path AND is connecting to our
+  // proxy, it was pre-formatted by a proxy-aware client (e.g. axios reading
+  // HTTP_PROXY automatically).  Pass it through unchanged to avoid double-wrapping.
+  if (
+    (path.startsWith("http://") || path.startsWith("https://")) &&
+    host === proxyHost &&
+    port === proxyPort
+  ) {
+    return origHttpRequest.call(http, options, callback);
+  }
 
   // Build the absolute URI the proxy expects.
   const absoluteUri = `http://${host}:${port}${path}`;
@@ -84,7 +95,7 @@ http.request = function (...args) {
     host: `${proxyHost}:${proxyPort}`,
     headers: {
       ...options.headers,
-      Host: port == 80 ? host : `${host}:${port}`,
+      Host: port === 80 ? host : `${host}:${port}`,
     },
   };
 
@@ -161,3 +172,130 @@ https.get = function (...args) {
   req.end();
   return req;
 };
+
+// ---------------------------------------------------------------------------
+// Undici / native fetch (Node.js 18+)
+// ---------------------------------------------------------------------------
+// undici implements its own HTTP stack and does NOT go through the patched
+// http/https modules above.  Redirect it through the proxy by installing a
+// global ProxyAgent dispatcher.  This also covers globalThis.fetch, which is
+// built on top of undici in Node.js 18+.
+
+(function patchUndici() {
+  let undici;
+  // Try the built-in first (Node 18.13+), then fall back to the npm package.
+  for (const mod of ["node:undici", "undici"]) {
+    try {
+      undici = require(mod);
+      break;
+    } catch (_) {}
+  }
+  if (!undici || !undici.ProxyAgent || !undici.setGlobalDispatcher) return;
+  try {
+    undici.setGlobalDispatcher(
+      new undici.ProxyAgent({
+        uri: PROXY_URL,
+        // phantom presents a MITM certificate — skip TLS verification.
+        connect: { rejectUnauthorized: false },
+      })
+    );
+  } catch (_) {
+    // Ignore: proxy agent creation can fail in some environments.
+  }
+})();
+
+// ---------------------------------------------------------------------------
+// Patch globalThis.fetch for HTTP
+// ---------------------------------------------------------------------------
+// undici's ProxyAgent (set above) sends a CONNECT tunnel for *all* requests
+// made via fetch(), including plain HTTP.  phantom handles CONNECT as an HTTPS
+// MITM tunnel — sending plain HTTP through it fails ("Connection reset by peer").
+//
+// Fix: wrap globalThis.fetch so that http:// requests are dispatched through
+// our already-patched http.request instead of through the ProxyAgent.
+// https:// requests are left unchanged (CONNECT → MITM works fine for TLS).
+
+if (typeof globalThis.fetch === "function") {
+  const _origFetch = globalThis.fetch;
+
+  globalThis.fetch = async function patchedFetch(input, init) {
+    // Determine the target URL string.
+    let urlStr;
+    try {
+      urlStr =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+    } catch (_) {
+      return _origFetch.apply(this, arguments);
+    }
+
+    // Only intercept plain HTTP; leave HTTPS to the ProxyAgent.
+    if (!urlStr.startsWith("http://")) {
+      return _origFetch.apply(this, arguments);
+    }
+
+    const url = new URL(urlStr);
+    const method = (
+      (init && init.method) ||
+      (input && input.method) ||
+      "GET"
+    ).toUpperCase();
+
+    // Normalise headers to a plain object.
+    const rawHeaders =
+      (init && init.headers) || (input && input.headers) || {};
+    const headers = {};
+    if (rawHeaders && typeof rawHeaders.entries === "function") {
+      for (const [k, v] of rawHeaders.entries()) headers[k] = v;
+    } else {
+      Object.assign(headers, rawHeaders);
+    }
+
+    // Serialise body to a Buffer if present.
+    let bodyData = null;
+    const rawBody = init && init.body;
+    if (rawBody != null) {
+      if (typeof rawBody === "string") bodyData = rawBody;
+      else if (Buffer.isBuffer(rawBody)) bodyData = rawBody;
+      else if (rawBody instanceof ArrayBuffer) bodyData = Buffer.from(rawBody);
+      else if (rawBody instanceof Uint8Array) bodyData = Buffer.from(rawBody);
+      // Streams, FormData, URLSearchParams, etc. fall through to origFetch.
+      else return _origFetch.apply(this, arguments);
+    }
+
+    // Dispatch through our patched http.request → goes via phantom proxy.
+    return new Promise((resolve, reject) => {
+      const opts = {
+        hostname: url.hostname,
+        port: url.port || 80,
+        path: url.pathname + (url.search || ""),
+        method,
+        headers,
+      };
+
+      const req = http.request(opts, (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const body = Buffer.concat(chunks);
+          // Node 18+ exposes Headers and Response as globals.
+          resolve(
+            new Response(body, {
+              status: res.statusCode,
+              statusText: res.statusMessage || "",
+              headers: new Headers(res.headers),
+            })
+          );
+        });
+        res.on("error", reject);
+      });
+
+      req.on("error", reject);
+      if (bodyData != null) req.write(bodyData);
+      req.end();
+    });
+  };
+}
