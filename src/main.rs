@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
@@ -9,6 +9,14 @@ use phantom_core::storage::TraceStore;
 use phantom_core::trace::HttpTrace;
 use phantom_storage::FjallTraceStore;
 use serde::Serialize;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Embedded proxy preload script (Node.js transparent injection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The proxy-preload.js content, embedded at compile time.
+/// Written to a temp file when tracing Node.js processes via `phantom -- node …`.
+const NODE_PROXY_PRELOAD: &str = include_str!("../tests/apps/node-app/proxy-preload.js");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -66,10 +74,21 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     agent_lib: Option<PathBuf>,
 
-    /// Command to run with LD_PRELOAD injected (required for --backend ldpreload).
+    /// Command to spawn and trace.
     ///
     /// Everything after `--` is treated as the command.
-    /// Example: `phantom --backend ldpreload --agent-lib ./libphantom_agent.so -- curl http://example.com`
+    ///
+    /// In proxy mode (`--backend proxy`): the command is launched with
+    /// `HTTP_PROXY` set automatically.  For Node.js commands (`node`/`nodejs`)
+    /// the proxy-preload script is also injected via `--require` so that HTTPS
+    /// is intercepted transparently without any changes to the application.
+    ///
+    /// In ldpreload mode (`--backend ldpreload`): the LD_PRELOAD agent is
+    /// injected into the child process (Linux only).
+    ///
+    /// Examples:
+    ///   `phantom -- node app.js`
+    ///   `phantom --backend ldpreload --agent-lib ./libphantom_agent.so -- curl http://example.com`
     #[arg(last = true, value_name = "CMD")]
     command: Vec<String>,
 }
@@ -246,19 +265,100 @@ async fn main() -> anyhow::Result<()> {
 // Proxy backend
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// RAII guard that deletes a temporary script file on drop.
+struct TempScript(PathBuf);
+
+impl Drop for TempScript {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Returns `true` if `exe` (path or bare name) resolves to `node` or `nodejs`.
+fn is_node_command(exe: &str) -> bool {
+    let base = Path::new(exe)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(exe);
+    base == "node" || base == "nodejs"
+}
+
+/// Spawns `command` as a child process routed through the phantom proxy.
+///
+/// * `HTTP_PROXY` / `http_proxy` are set so plain HTTP is captured.
+/// * For Node.js executables the embedded proxy-preload script is written to a
+///   temp file and prepended as `--require <path>` so HTTPS is also captured
+///   without touching the application source.
+///
+/// Returns `(child, Option<TempScript>)`.  The `TempScript` must be kept alive
+/// until after the child exits so the file is not deleted prematurely.
+fn spawn_proxy_child(
+    command: &[String],
+    proxy_port: u16,
+) -> anyhow::Result<(std::process::Child, Option<TempScript>)> {
+    let exe = &command[0];
+    let proxy_url = format!("http://127.0.0.1:{proxy_port}");
+
+    let (actual_args, temp_script): (Vec<String>, Option<TempScript>) = if is_node_command(exe) {
+        // Write the embedded preload script to a temp file.
+        let script_path =
+            std::env::temp_dir().join(format!("phantom-preload-{}.js", std::process::id()));
+        std::fs::write(&script_path, NODE_PROXY_PRELOAD)
+            .map_err(|e| anyhow::anyhow!("failed to write proxy preload script: {e}"))?;
+        let ts = TempScript(script_path.clone());
+
+        // Prepend --require <script> before the rest of the args.
+        let mut args = vec![
+            "--require".to_string(),
+            script_path.to_string_lossy().into_owned(),
+        ];
+        args.extend_from_slice(&command[1..]);
+        (args, Some(ts))
+    } else {
+        (command[1..].to_vec(), None)
+    };
+
+    let child = std::process::Command::new(exe)
+        .args(&actual_args)
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn {:?}: {e}", exe))?;
+
+    Ok((child, temp_script))
+}
+
 async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
     let mut backend = ProxyCaptureBackend::new(cli.port, cli.insecure);
     let backend_name = backend.name().to_string();
     let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Optionally spawn a child command routed through the proxy.
+    let child_and_script: Option<(std::process::Child, Option<TempScript>)> =
+        if !cli.command.is_empty() {
+            // Wait for the proxy to be ready before spawning the child.
+            wait_for_proxy(cli.port).await?;
+            let (child, ts) = spawn_proxy_child(&cli.command, cli.port)?;
+            eprintln!(
+                "phantom: spawned PID {} → {}",
+                child.id(),
+                cli.command.join(" ")
+            );
+            Some((child, ts))
+        } else {
+            None
+        };
+
     match cli.output {
         OutputMode::Tui => {
-            eprintln!("phantom: proxy listening on 127.0.0.1:{}", cli.port);
-            eprintln!("  Set your HTTP proxy to http://127.0.0.1:{}", cli.port);
-            eprintln!(
-                "  Example: curl -x http://127.0.0.1:{} http://httpbin.org/get",
-                cli.port
-            );
+            if cli.command.is_empty() {
+                eprintln!("phantom: proxy listening on 127.0.0.1:{}", cli.port);
+                eprintln!("  Set your HTTP proxy to http://127.0.0.1:{}", cli.port);
+                eprintln!(
+                    "  Example: curl -x http://127.0.0.1:{} http://httpbin.org/get",
+                    cli.port
+                );
+            }
             eprintln!(
                 "phantom: traces stored in {}",
                 store_path_display(&cli.data_dir)
@@ -270,12 +370,37 @@ async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> 
                 "phantom: proxy listening on 127.0.0.1:{} [jsonl mode]",
                 cli.port
             );
-            run_jsonl_output(store, trace_rx, None).await?;
+            // Split into child and script guard separately so the TempScript
+            // is NOT dropped until after run_jsonl_output completes (the file
+            // must exist while node is loading it via --require).
+            let (child, _script_guard) = match child_and_script {
+                Some((c, ts)) => (Some(c), ts),
+                None => (None, None),
+            };
+            run_jsonl_output(store, trace_rx, child).await?;
+            // _script_guard dropped here — temp file deleted after child exits.
         }
     }
 
     backend.stop().map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+/// Poll until the proxy port is accepting connections (or timeout after 5 s).
+async fn wait_for_proxy(port: u16) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("proxy did not become ready on port {port} within 5 s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

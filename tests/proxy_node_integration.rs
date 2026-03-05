@@ -1,8 +1,9 @@
-//! Integration test: Node.js app → phantom proxy → Rust mock backend
+//! Integration test: phantom proxy transparently traces a Node.js app
 //!
 //! Verifies non-invasive proxy tracing: the Node.js client has ZERO proxy
-//! awareness.  A `--require proxy-preload.js` script transparently patches
-//! `http`/`https` to route through phantom (like LD_PRELOAD for Node.js).
+//! awareness.  `phantom -- node client.js` automatically injects
+//! `proxy-preload.js` (embedded in the binary) via `--require`, transparently
+//! patching `http`/`https` to route through the phantom proxy.
 //!
 //! Tests both HTTP and HTTPS (MITM) capture.
 //!
@@ -37,24 +38,6 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     false
-}
-
-struct ProcessGuard(Option<std::process::Child>);
-impl ProcessGuard {
-    fn new(child: std::process::Child) -> Self {
-        Self(Some(child))
-    }
-    fn take(&mut self) -> std::process::Child {
-        self.0.take().expect("already consumed")
-    }
-}
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
-        if let Some(ref mut c) = self.0 {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,8 +180,10 @@ fn test_proxy_captures_node_app_traffic() {
         "HTTPS backend"
     );
 
-    // ── Start phantom proxy (--insecure to accept self-signed backend) ──
-    let phantom_proc = Command::new(phantom_bin)
+    // ── Run phantom with `-- node client.js` ────────────────────────────
+    // In JSONL mode phantom exits automatically when the child process exits.
+    // The proxy-preload.js is injected automatically by phantom for Node.js.
+    let phantom_output = Command::new(phantom_bin)
         .args([
             "--backend",
             "proxy",
@@ -210,56 +195,25 @@ fn test_proxy_captures_node_app_traffic() {
             "--data-dir",
         ])
         .arg(tmp_dir.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn phantom");
-
-    let mut phantom_guard = ProcessGuard::new(phantom_proc);
-    assert!(
-        wait_for_port(proxy_port, Duration::from_secs(5)),
-        "phantom proxy"
-    );
-
-    // ── Run client via --require proxy-preload.js ────────────────────────
-    let preload = app_dir.join("proxy-preload.js");
-    let client_output = Command::new("node")
-        .args(["--require", &preload.to_string_lossy()])
+        .arg("--")
+        .arg("node")
         .arg(app_dir.join("client.js"))
         .env("BACKEND_HTTP_URL", format!("http://127.0.0.1:{http_port}"))
         .env(
             "BACKEND_HTTPS_URL",
             format!("https://localhost:{https_port}"),
         )
-        .env("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}"))
         .env("NODE_TLS_REJECT_UNAUTHORIZED", "0")
         .output()
-        .expect("run client.js");
+        .expect("run phantom");
 
-    let client_stdout = String::from_utf8_lossy(&client_output.stdout);
-    let client_stderr = String::from_utf8_lossy(&client_output.stderr);
+    let stdout_buf = String::from_utf8_lossy(&phantom_output.stdout).into_owned();
+    let stderr_buf = String::from_utf8_lossy(&phantom_output.stderr).into_owned();
+
     assert!(
-        client_output.status.success(),
-        "client.js failed.\n  stdout: {client_stdout}\n  stderr: {client_stderr}"
+        phantom_output.status.success(),
+        "phantom exited non-zero.\n  stdout:\n{stdout_buf}\n  stderr:\n{stderr_buf}"
     );
-    assert!(
-        client_stdout.contains("CLIENT_DONE"),
-        "client.js incomplete.\n  stdout: {client_stdout}\n  stderr: {client_stderr}"
-    );
-
-    // ── Collect phantom output ───────────────────────────────────────────
-    std::thread::sleep(Duration::from_millis(500));
-
-    let mut phantom_proc = phantom_guard.take();
-    let mut phantom_stdout = phantom_proc.stdout.take().unwrap();
-    let mut phantom_stderr_h = phantom_proc.stderr.take().unwrap();
-    phantom_proc.kill().ok();
-    phantom_proc.wait().ok();
-
-    let mut stdout_buf = String::new();
-    phantom_stdout.read_to_string(&mut stdout_buf).ok();
-    let mut stderr_buf = String::new();
-    phantom_stderr_h.read_to_string(&mut stderr_buf).ok();
 
     // ── Parse JSONL traces ───────────────────────────────────────────────
     let traces: Vec<serde_json::Value> = stdout_buf
@@ -271,7 +225,7 @@ fn test_proxy_captures_node_app_traffic() {
     assert_eq!(
         traces.len(),
         4,
-        "Expected 4 traces (2 HTTP + 2 HTTPS), got {}.\n  stdout:\n{stdout_buf}\n  stderr:\n{stderr_buf}\n  client:\n{client_stdout}",
+        "Expected 4 traces (2 HTTP + 2 HTTPS), got {}.\\n  stdout:\\n{stdout_buf}\\n  stderr:\\n{stderr_buf}",
         traces.len(),
     );
 
