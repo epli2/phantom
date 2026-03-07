@@ -372,6 +372,15 @@ fn is_node_command(exe: &str) -> bool {
     base == "node" || base == "nodejs"
 }
 
+/// Returns `true` if `exe` (path or bare name) resolves to `java` or `javaw`.
+fn is_java_command(exe: &str) -> bool {
+    let base = Path::new(exe)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(exe);
+    base == "java" || base == "javaw"
+}
+
 /// Spawns `command` as a child process routed through the phantom proxy.
 ///
 /// * `HTTP_PROXY` / `http_proxy` are set so plain HTTP is captured.
@@ -407,10 +416,26 @@ fn spawn_proxy_child(
         (command[1..].to_vec(), None)
     };
 
-    let child = std::process::Command::new(exe)
-        .args(&actual_args)
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&actual_args)
         .env("HTTP_PROXY", &proxy_url)
-        .env("http_proxy", &proxy_url)
+        .env("http_proxy", &proxy_url);
+
+    // For Java processes, inject proxy settings via JAVA_TOOL_OPTIONS so any
+    // JVM application is traced transparently — no app-level proxy code needed.
+    // We append to any existing JAVA_TOOL_OPTIONS (e.g. set by the CI environment)
+    // so the phantom proxy settings take effect last (last -D wins in JVM args).
+    // -Dhttp.nonProxyHosts= clears the exclusion list (which often includes
+    // localhost/127.0.0.1 in CI) so local test backends are also proxied.
+    if is_java_command(exe) {
+        let proxy_jvm_opts = format!(
+            " -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={proxy_port} -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={proxy_port} -Dhttp.nonProxyHosts= -Dhttps.nonProxyHosts="
+        );
+        let existing = std::env::var("JAVA_TOOL_OPTIONS").unwrap_or_default();
+        cmd.env("JAVA_TOOL_OPTIONS", format!("{existing}{proxy_jvm_opts}"));
+    }
+
+    let child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {:?}: {e}", exe))?;
 

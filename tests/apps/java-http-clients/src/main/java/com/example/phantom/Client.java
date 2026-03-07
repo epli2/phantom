@@ -1,35 +1,37 @@
 package com.example.phantom;
 
-// A plain Java CLI application that makes HTTP and HTTPS requests using four
-// different HTTP client libraries. This file contains ZERO proxy configuration
-// — the proxy is configured based on the HTTP_PROXY environment variable that
-// phantom sets automatically when running:  phantom -- java -jar client.jar
+// A plain Java CLI application that makes HTTP and HTTPS requests using two
+// Java HTTP client libraries that honour JVM system proxy settings.
+//
+// This file contains ZERO proxy configuration.  Phantom injects the proxy
+// transparently via JAVA_TOOL_OPTIONS when running:
+//
+//   phantom -- java -jar client.jar
+//
+// Phantom sets -Dhttp.proxyHost / -Dhttps.proxyHost etc. so both clients
+// pick up the proxy automatically through ProxySelector.getDefault().
+//
+// The trust-all SSLContext is required because phantom performs MITM for
+// HTTPS — it presents its own dynamically-generated certificate.  This is
+// the equivalent of NODE_TLS_REJECT_UNAUTHORIZED=0 in the Node.js tests.
 //
 // Environment:
-//   HTTP_PROXY         — set by phantom, e.g. http://127.0.0.1:8080
 //   BACKEND_HTTP_URL   — e.g. http://127.0.0.1:3000
 //   BACKEND_HTTPS_URL  — e.g. https://localhost:3443  (optional)
 //
-// Each client adds an x-phantom-client header to identify itself in traces.
+// Each client adds an x-phantom-client header so traces can be identified.
 
-import org.asynchttpclient.*;
-import org.asynchttpclient.proxy.ProxyServer;
-import org.eclipse.jetty.client.HttpClient;
-import org.eclipse.jetty.client.HttpProxy;
-import org.eclipse.jetty.client.transport.HttpClientTransportOverHTTP;
-import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.apache.hc.client5.http.classic.methods.HttpGet;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.impl.routing.SystemDefaultRoutePlanner;
 import org.apache.hc.client5.http.ssl.NoopHostnameVerifier;
 import org.apache.hc.client5.http.ssl.SSLConnectionSocketFactoryBuilder;
-import org.apache.hc.core5.http.HttpHost;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.ssl.SSLContextBuilder;
 
 import javax.net.ssl.*;
-import java.net.InetSocketAddress;
 import java.net.ProxySelector;
 import java.net.URI;
 import java.net.http.HttpRequest;
@@ -42,15 +44,6 @@ public class Client {
     // -------------------------------------------------------------------------
     // Shared helpers
     // -------------------------------------------------------------------------
-
-    /** Parse HTTP_PROXY env var → InetSocketAddress, or null if not set. */
-    static InetSocketAddress proxyAddress() {
-        String raw = System.getenv("HTTP_PROXY");
-        if (raw == null) raw = System.getenv("http_proxy");
-        if (raw == null) return null;
-        URI u = URI.create(raw);
-        return new InetSocketAddress(u.getHost(), u.getPort());
-    }
 
     /** SSLContext that trusts any certificate (for MITM testing). */
     static SSLContext trustAllSslContext() throws Exception {
@@ -69,13 +62,11 @@ public class Client {
     // -------------------------------------------------------------------------
 
     static void runJdkHttpClient(String httpBase, String httpsBase) throws Exception {
-        InetSocketAddress proxy = proxyAddress();
-        java.net.http.HttpClient.Builder builder = java.net.http.HttpClient.newBuilder()
-                .sslContext(trustAllSslContext());
-        if (proxy != null) {
-            builder.proxy(ProxySelector.of(proxy));
-        }
-        java.net.http.HttpClient client = builder.build();
+        // No explicit proxy — automatically uses ProxySelector.getDefault()
+        // which reads -Dhttp.proxyHost / -Dhttps.proxyHost injected by phantom.
+        java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                .sslContext(trustAllSslContext())
+                .build();
 
         // HTTP
         HttpRequest httpReq = HttpRequest.newBuilder()
@@ -97,88 +88,14 @@ public class Client {
     }
 
     // -------------------------------------------------------------------------
-    // 2. AsyncHttpClient (Netty-based)
-    // -------------------------------------------------------------------------
-
-    static void runAsyncHttpClient(String httpBase, String httpsBase) throws Exception {
-        InetSocketAddress proxy = proxyAddress();
-        DefaultAsyncHttpClientConfig.Builder cfgBuilder =
-                new DefaultAsyncHttpClientConfig.Builder()
-                        .setUseInsecureTrustManager(true);
-        if (proxy != null) {
-            cfgBuilder.setProxyServer(new ProxyServer.Builder(proxy.getHostName(), proxy.getPort()).build());
-        }
-
-        try (AsyncHttpClient client = new DefaultAsyncHttpClient(cfgBuilder.build())) {
-            // HTTP
-            Response r1 = client.prepareGet(httpBase + "/api/health")
-                    .addHeader("x-phantom-client", "async-http-client")
-                    .execute().get();
-            System.out.println("async http: status=" + r1.getStatusCode() + " body=" + r1.getResponseBody());
-
-            // HTTPS
-            if (httpsBase != null) {
-                Response r2 = client.prepareGet(httpsBase + "/api/health")
-                        .addHeader("x-phantom-client", "async-http-client")
-                        .execute().get();
-                System.out.println("async https: status=" + r2.getStatusCode() + " body=" + r2.getResponseBody());
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // 3. Jetty HttpClient
-    // -------------------------------------------------------------------------
-
-    static void runJettyHttpClient(String httpBase, String httpsBase) throws Exception {
-        InetSocketAddress proxy = proxyAddress();
-
-        SslContextFactory.Client sslFactory = new SslContextFactory.Client(true);
-        sslFactory.setSslContext(trustAllSslContext());
-
-        HttpClient client = new HttpClient(new HttpClientTransportOverHTTP());
-        client.setSslContextFactory(sslFactory);
-
-        if (proxy != null) {
-            client.getProxyConfiguration().addProxy(
-                    new HttpProxy(proxy.getHostName(), proxy.getPort()));
-        }
-
-        client.start();
-        try {
-            // HTTP
-            org.eclipse.jetty.client.ContentResponse r1 = client.newRequest(httpBase + "/api/health")
-                    .method(org.eclipse.jetty.http.HttpMethod.GET)
-                    .headers(h -> h.add("x-phantom-client", "jetty-httpclient"))
-                    .send();
-            System.out.println("jetty http: status=" + r1.getStatus() + " body=" + r1.getContentAsString());
-
-            // HTTPS
-            if (httpsBase != null) {
-                org.eclipse.jetty.client.ContentResponse r2 = client.newRequest(httpsBase + "/api/health")
-                        .method(org.eclipse.jetty.http.HttpMethod.GET)
-                        .headers(h -> h.add("x-phantom-client", "jetty-httpclient"))
-                        .send();
-                System.out.println("jetty https: status=" + r2.getStatus() + " body=" + r2.getContentAsString());
-            }
-        } finally {
-            client.stop();
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // 4. Apache HttpClient 5
+    // 2. Apache HttpClient 5
     // -------------------------------------------------------------------------
 
     static void runApacheHttpClient(String httpBase, String httpsBase) throws Exception {
-        InetSocketAddress proxy = proxyAddress();
-
-        SSLContext sslCtx = SSLContextBuilder.create()
-                .loadTrustMaterial((chain, authType) -> true)
-                .build();
-
         var sslSocketFactory = SSLConnectionSocketFactoryBuilder.create()
-                .setSslContext(sslCtx)
+                .setSslContext(SSLContextBuilder.create()
+                        .loadTrustMaterial((chain, authType) -> true)
+                        .build())
                 .setHostnameVerifier(new NoopHostnameVerifier())
                 .build();
 
@@ -186,14 +103,15 @@ public class Client {
                 .setSSLSocketFactory(sslSocketFactory)
                 .build();
 
-        var clientBuilder = HttpClients.custom()
-                .setConnectionManager(connManager);
+        // SystemDefaultRoutePlanner reads ProxySelector.getDefault(), which
+        // respects -Dhttp.proxyHost / -Dhttps.proxyHost injected by phantom.
+        var routePlanner = new SystemDefaultRoutePlanner(ProxySelector.getDefault());
 
-        if (proxy != null) {
-            clientBuilder.setProxy(new HttpHost(proxy.getHostName(), proxy.getPort()));
-        }
+        try (CloseableHttpClient client = HttpClients.custom()
+                .setConnectionManager(connManager)
+                .setRoutePlanner(routePlanner)
+                .build()) {
 
-        try (CloseableHttpClient client = clientBuilder.build()) {
             // HTTP
             HttpGet get1 = new HttpGet(httpBase + "/api/health");
             get1.addHeader("x-phantom-client", "apache-httpclient");
@@ -226,8 +144,6 @@ public class Client {
         }
 
         runJdkHttpClient(httpBase, httpsBase);
-        runAsyncHttpClient(httpBase, httpsBase);
-        runJettyHttpClient(httpBase, httpsBase);
         runApacheHttpClient(httpBase, httpsBase);
 
         System.out.println("CLIENT_DONE");
