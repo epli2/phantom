@@ -13,6 +13,7 @@ package com.example.phantom;
 // Each client adds an x-phantom-client header to identify itself in traces.
 
 import org.asynchttpclient.*;
+import org.asynchttpclient.proxy.ProxyServer;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.HttpProxy;
 import org.eclipse.jetty.client.transport.HttpClientTransportOverHTTP;
@@ -26,7 +27,6 @@ import org.apache.hc.client5.http.ssl.SSLConnectionSocketFactoryBuilder;
 import org.apache.hc.core5.http.HttpHost;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.ssl.SSLContextBuilder;
-import org.apache.hc.core5.ssl.TrustAllStrategy;
 
 import javax.net.ssl.*;
 import java.net.InetSocketAddress;
@@ -104,7 +104,6 @@ public class Client {
         InetSocketAddress proxy = proxyAddress();
         DefaultAsyncHttpClientConfig.Builder cfgBuilder =
                 new DefaultAsyncHttpClientConfig.Builder()
-                        .setSslContext(trustAllSslContext())
                         .setUseInsecureTrustManager(true);
         if (proxy != null) {
             cfgBuilder.setProxyServer(new ProxyServer.Builder(proxy.getHostName(), proxy.getPort()).build());
@@ -175,7 +174,7 @@ public class Client {
         InetSocketAddress proxy = proxyAddress();
 
         SSLContext sslCtx = SSLContextBuilder.create()
-                .loadTrustMaterial(TrustAllStrategy.INSTANCE)
+                .loadTrustMaterial((chain, authType) -> true)
                 .build();
 
         var sslSocketFactory = SSLConnectionSocketFactoryBuilder.create()
