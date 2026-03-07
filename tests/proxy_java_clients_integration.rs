@@ -1,12 +1,14 @@
 //! Integration test: phantom proxy transparently traces Java HTTP client libraries
 //!
 //! Verifies that phantom's proxy backend captures HTTP and HTTPS traffic from
-//! four major Java HTTP client libraries:
+//! Java HTTP client libraries that honour JVM system proxy settings:
 //!
 //!   1. JDK java.net.http.HttpClient  (built-in, Java 11+)
-//!   2. AsyncHttpClient               (Netty-based)
-//!   3. Jetty HttpClient
-//!   4. Apache HttpClient 5
+//!   2. Apache HttpClient 5
+//!
+//! Phantom injects the proxy transparently via JAVA_TOOL_OPTIONS — the Java
+//! application itself contains zero proxy configuration code.  This mirrors
+//! how phantom injects proxy-preload.js for Node.js applications.
 //!
 //! Each client adds an `x-phantom-client` request header so traces can be
 //! identified in the JSONL output.  The pattern mirrors the Node.js
@@ -222,8 +224,8 @@ fn test_proxy_captures_java_http_clients() {
     );
 
     // ── Run phantom with `-- java -jar client.jar` ────────────────────────
-    // phantom sets HTTP_PROXY automatically; the Java app reads it to
-    // configure each client's proxy selector.
+    // phantom injects -Dhttp.proxyHost / -Dhttps.proxyHost via JAVA_TOOL_OPTIONS
+    // so the Java app needs zero proxy configuration of its own.
     let phantom_output = Command::new(phantom_bin)
         .args([
             "--backend",
@@ -263,22 +265,17 @@ fn test_proxy_captures_java_http_clients() {
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
 
-    // 4 clients × 2 schemes (HTTP + HTTPS) = 8 traces
+    // 2 clients × 2 schemes (HTTP + HTTPS) = 4 traces
     assert_eq!(
         traces.len(),
-        8,
-        "Expected 8 traces (4 clients × 2 schemes), got {}.\
+        4,
+        "Expected 4 traces (2 clients × 2 schemes), got {}.\
          \n  stdout:\n{stdout_buf}\n  stderr:\n{stderr_buf}",
         traces.len(),
     );
 
     // ── Per-client assertions ─────────────────────────────────────────────
-    let clients = [
-        "jdk-httpclient",
-        "async-http-client",
-        "jetty-httpclient",
-        "apache-httpclient",
-    ];
+    let clients = ["jdk-httpclient", "apache-httpclient"];
 
     for client in clients {
         for scheme in ["http", "https"] {
@@ -337,7 +334,7 @@ fn test_proxy_captures_java_http_clients() {
     }
 
     eprintln!(
-        "All 8 traces verified. clients: {:?}",
+        "All 4 traces verified. clients: {:?}",
         traces.iter().map(client_of).collect::<Vec<_>>()
     );
 }
