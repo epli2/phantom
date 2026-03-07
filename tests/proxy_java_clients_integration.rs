@@ -89,7 +89,9 @@ fn handle_stream(stream: &mut (impl Read + IoWrite)) {
 fn start_http_backend(port: u16) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let listener = TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
-        listener.set_nonblocking(false).expect("set_nonblocking(false)");
+        listener
+            .set_nonblocking(false)
+            .expect("set_nonblocking(false)");
         for stream in listener.incoming() {
             match stream {
                 Ok(mut s) => handle_stream(&mut s),
@@ -291,9 +293,7 @@ fn test_proxy_captures_java_http_clients() {
             assert_eq!(t["method"], "GET", "{client} {scheme} method");
             assert_eq!(t["status_code"], 200, "{client} {scheme} status_code");
             assert!(
-                t["url"]
-                    .as_str()
-                    .is_some_and(|u| u.contains("/api/health")),
+                t["url"].as_str().is_some_and(|u| u.contains("/api/health")),
                 "{client} {scheme} url should contain /api/health"
             );
             assert!(
