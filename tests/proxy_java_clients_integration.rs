@@ -180,16 +180,23 @@ fn test_proxy_captures_java_http_clients() {
     let app_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/apps/java-http-clients");
     let tmp_dir = tempfile::tempdir().expect("tempdir");
 
-    // ── Build the fat JAR ─────────────────────────────────────────────────
-    let mvn_status = Command::new("mvn")
-        .args(["package", "-q", "--no-transfer-progress", "-f"])
-        .arg(app_dir.join("pom.xml"))
-        .status()
-        .expect("mvn package");
-    assert!(mvn_status.success(), "mvn package failed");
-
+    // ── Build the fat JAR (skip if already built) ─────────────────────────
     let jar_path = app_dir.join("target/java-http-clients-0.0.1-SNAPSHOT.jar");
-    assert!(jar_path.exists(), "JAR not found at {jar_path:?}");
+    if !jar_path.exists() {
+        let mvn_status = Command::new("mvn")
+            .args([
+                "package",
+                "-q",
+                "--no-transfer-progress",
+                "-Dmaven.resolver.transport=wagon",
+                "-f",
+            ])
+            .arg(app_dir.join("pom.xml"))
+            .status()
+            .expect("mvn package");
+        assert!(mvn_status.success(), "mvn package failed");
+        assert!(jar_path.exists(), "JAR not found at {jar_path:?}");
+    }
 
     let http_port = available_port();
     let https_port = available_port();
