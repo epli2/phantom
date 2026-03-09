@@ -265,20 +265,29 @@ fn test_proxy_captures_java_http_clients() {
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
 
-    // 2 clients × 2 schemes (HTTP + HTTPS) = 4 traces
+    // 5 clients (JDK:2, Apache:2, Netty:2, Jetty:1, OkHttp:2) = 9 traces
     assert_eq!(
         traces.len(),
-        4,
-        "Expected 4 traces (2 clients × 2 schemes), got {}.\
+        9,
+        "Expected 9 traces, got {}.\
          \n  stdout:\n{stdout_buf}\n  stderr:\n{stderr_buf}",
         traces.len(),
     );
 
     // ── Per-client assertions ─────────────────────────────────────────────
-    let clients = ["jdk-httpclient", "apache-httpclient"];
+    let clients = [
+        "jdk-httpclient",
+        "apache-httpclient",
+        "netty-httpclient",
+        "jetty-httpclient",
+        "okhttp-httpclient",
+    ];
 
     for client in clients {
         for scheme in ["http", "https"] {
+            if client == "jetty-httpclient" && scheme == "https" {
+                continue;
+            }
             let t = traces
                 .iter()
                 .find(|t| {

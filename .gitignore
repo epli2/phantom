@@ -3,3 +3,11 @@
 **/node_modules/**
 .idea/
 
+# Java artifacts
+*.class
+*.jar
+!crates/phantom-java-agent/src/**/*.java
+!tests/apps/java-http-clients/src/**/*.java
+**/out/
+manifest.txt
+

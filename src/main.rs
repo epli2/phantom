@@ -411,12 +411,30 @@ fn is_java_command(exe: &str) -> bool {
     base == "java" || base == "javaw"
 }
 
+/// Returns the path to the phantom Java Agent JAR if it exists in the build output.
+fn find_java_agent_jar() -> Option<PathBuf> {
+    // Check common build locations relative to the executable.
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+
+    let candidates = [
+        // Development: crates/phantom-java-agent/phantom-java-agent.jar
+        PathBuf::from("crates/phantom-java-agent/phantom-java-agent.jar"),
+        // Relative to binary in target/debug/ or target/release/
+        exe_dir.join("../../../crates/phantom-java-agent/phantom-java-agent.jar"),
+        exe_dir.join("phantom-java-agent.jar"),
+    ];
+
+    candidates.into_iter().find(|path| path.exists())
+}
+
 /// Spawns `command` as a child process routed through the phantom proxy.
 ///
 /// * `HTTP_PROXY` / `http_proxy` are set so plain HTTP is captured.
 /// * For Node.js executables the embedded proxy-preload script is written to a
 ///   temp file and prepended as `--require <path>` so HTTPS is also captured
 ///   without touching the application source.
+/// * For Java executables, the phantom-java-agent.jar is injected via -javaagent
+///   to force proxy settings and bypass SSL verification globally.
 ///
 /// Returns `(child, Option<TempScript>)`.  The `TempScript` must be kept alive
 /// until after the child exits so the file is not deleted prematurely.
@@ -451,18 +469,20 @@ fn spawn_proxy_child(
         .env("HTTP_PROXY", &proxy_url)
         .env("http_proxy", &proxy_url);
 
-    // For Java processes, inject proxy settings via JAVA_TOOL_OPTIONS so any
-    // JVM application is traced transparently — no app-level proxy code needed.
-    // We append to any existing JAVA_TOOL_OPTIONS (e.g. set by the CI environment)
-    // so the phantom proxy settings take effect last (last -D wins in JVM args).
-    // -Dhttp.nonProxyHosts= clears the exclusion list (which often includes
-    // localhost/127.0.0.1 in CI) so local test backends are also proxied.
+    // For Java processes, inject proxy settings and the Java Agent via JAVA_TOOL_OPTIONS.
     if is_java_command(exe) {
-        let proxy_jvm_opts = format!(
+        let mut jvm_opts = format!(
             " -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={proxy_port} -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={proxy_port} -Dhttp.nonProxyHosts= -Dhttps.nonProxyHosts="
         );
+
+        // Inject Java Agent if found to force proxy and bypass SSL verification.
+        if let Some(agent_path) = find_java_agent_jar() {
+            let agent_arg = format!(" -javaagent:{}", agent_path.display());
+            jvm_opts.push_str(&agent_arg);
+        }
+
         let existing = std::env::var("JAVA_TOOL_OPTIONS").unwrap_or_default();
-        cmd.env("JAVA_TOOL_OPTIONS", format!("{existing}{proxy_jvm_opts}"));
+        cmd.env("JAVA_TOOL_OPTIONS", format!("{existing}{jvm_opts}"));
     }
 
     let child = cmd
