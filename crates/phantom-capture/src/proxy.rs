@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::{Instant, SystemTime};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use http::uri::Scheme;
 use hudsucker::certificate_authority::RcgenAuthority;
@@ -13,12 +14,15 @@ use phantom_core::trace::{HttpMethod, HttpTrace, SpanId, TraceId};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+use crate::fault::{FaultConfig, FaultRule};
+
 /// Maximum body size to capture (1 MB).
 const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 pub struct ProxyCaptureBackend {
     listen_port: u16,
     insecure: bool,
+    fault_config: FaultConfig,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -28,9 +32,16 @@ impl ProxyCaptureBackend {
         Self {
             listen_port,
             insecure,
+            fault_config: FaultConfig::default(),
             shutdown_tx: None,
             task_handle: None,
         }
+    }
+
+    /// Attach fault injection rules (builder pattern).
+    pub fn with_faults(mut self, config: FaultConfig) -> Self {
+        self.fault_config = config;
+        self
     }
 }
 
@@ -42,6 +53,7 @@ impl CaptureBackend for ProxyCaptureBackend {
         let handler = TraceHandler {
             trace_tx,
             pending: None,
+            fault_config: Arc::new(self.fault_config.clone()),
         };
 
         let port = self.listen_port;
@@ -132,6 +144,7 @@ struct TraceHandler {
     trace_tx: mpsc::Sender<HttpTrace>,
     /// Pending request info, set in handle_request, consumed in handle_response.
     pending: Option<PendingRequest>,
+    fault_config: Arc<FaultConfig>,
 }
 
 #[derive(Clone)]
@@ -172,6 +185,72 @@ impl HttpHandler for TraceHandler {
         });
 
         let rebuilt = Request::from_parts(parts, body_to_body(body_bytes));
+
+        // Apply fault injection rules in order.
+        let url = self
+            .pending
+            .as_ref()
+            .map(|p| p.url.clone())
+            .unwrap_or_default();
+        for rule in &self.fault_config.rules {
+            if !rule.matches_url(&url) {
+                continue;
+            }
+            match rule {
+                FaultRule::Delay {
+                    min_ms, max_ms, ..
+                } => {
+                    let delay_ms = if min_ms == max_ms {
+                        *min_ms
+                    } else {
+                        min_ms + rand::random::<u64>() % (max_ms - min_ms + 1)
+                    };
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                FaultRule::Error {
+                    status_code,
+                    probability,
+                    ..
+                } => {
+                    if rand::random::<f64>() < *probability {
+                        // Emit a trace immediately — handle_response won't be called.
+                        if let Some(info) = self.pending.take() {
+                            let fault_body = b"{\"fault\":\"injected\"}".to_vec();
+                            let trace = HttpTrace {
+                                span_id: info.span_id,
+                                trace_id: info.trace_id,
+                                parent_span_id: None,
+                                method: info.method,
+                                url: info.url,
+                                request_headers: info.request_headers,
+                                request_body: info.request_body,
+                                status_code: *status_code,
+                                response_headers: HashMap::new(),
+                                response_body: Some(fault_body),
+                                timestamp: info.timestamp,
+                                duration: info.started_at.elapsed(),
+                                source_addr: info.source_addr,
+                                dest_addr: None,
+                                protocol_version: info.protocol_version,
+                            };
+                            if self.trace_tx.try_send(trace).is_err() {
+                                warn!("Trace channel full, dropping fault-injected trace");
+                            }
+                        }
+                        let body_bytes: bytes::Bytes =
+                            b"{\"fault\":\"injected\"}".as_ref().into();
+                        let response = Response::builder()
+                            .status(*status_code)
+                            .header("content-type", "application/json")
+                            .header("x-fault-injected", "phantom")
+                            .body(Body::from(http_body_util::Full::new(body_bytes)))
+                            .expect("valid fault response");
+                        return RequestOrResponse::Response(response);
+                    }
+                }
+            }
+        }
+
         RequestOrResponse::Request(rebuilt)
     }
 
