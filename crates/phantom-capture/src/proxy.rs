@@ -197,9 +197,7 @@ impl HttpHandler for TraceHandler {
                 continue;
             }
             match rule {
-                FaultRule::Delay {
-                    min_ms, max_ms, ..
-                } => {
+                FaultRule::Delay { min_ms, max_ms, .. } => {
                     let delay_ms = if min_ms == max_ms {
                         *min_ms
                     } else {
@@ -225,7 +223,15 @@ impl HttpHandler for TraceHandler {
                                 request_headers: info.request_headers,
                                 request_body: info.request_body,
                                 status_code: *status_code,
-                                response_headers: HashMap::new(),
+                                response_headers: {
+                                    let mut h = HashMap::new();
+                                    h.insert(
+                                        "content-type".to_string(),
+                                        "application/json".to_string(),
+                                    );
+                                    h.insert("x-fault-injected".to_string(), "phantom".to_string());
+                                    h
+                                },
                                 response_body: Some(fault_body),
                                 timestamp: info.timestamp,
                                 duration: info.started_at.elapsed(),
@@ -237,8 +243,7 @@ impl HttpHandler for TraceHandler {
                                 warn!("Trace channel full, dropping fault-injected trace");
                             }
                         }
-                        let body_bytes: bytes::Bytes =
-                            b"{\"fault\":\"injected\"}".as_ref().into();
+                        let body_bytes: bytes::Bytes = b"{\"fault\":\"injected\"}".as_ref().into();
                         let response = Response::builder()
                             .status(*status_code)
                             .header("content-type", "application/json")

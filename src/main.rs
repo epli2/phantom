@@ -449,8 +449,7 @@ fn spawn_proxy_child(
 
 async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
     let fault_config = build_fault_config(&cli.fault)?;
-    let mut backend = ProxyCaptureBackend::new(cli.port, cli.insecure)
-        .with_faults(fault_config);
+    let mut backend = ProxyCaptureBackend::new(cli.port, cli.insecure).with_faults(fault_config);
     let backend_name = backend.name().to_string();
     let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 

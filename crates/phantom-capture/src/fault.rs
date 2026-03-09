@@ -25,7 +25,10 @@ impl FaultRule {
             FaultRule::Delay { url_pattern, .. } => url_pattern,
             FaultRule::Error { url_pattern, .. } => url_pattern,
         };
-        pattern.as_ref().map(|p| url.contains(p.as_str())).unwrap_or(true)
+        pattern
+            .as_ref()
+            .map(|p| url.contains(p.as_str()))
+            .unwrap_or(true)
     }
 }
 
@@ -105,21 +108,20 @@ fn parse_error(rest: &str) -> Result<FaultRule, String> {
         .parse()
         .map_err(|_| format!("invalid HTTP status code {:?}", parts[0]))?;
     if !(100..=599).contains(&status_code) {
-        return Err(format!(
-            "status code {status_code} is out of range 100–599"
-        ));
+        return Err(format!("status code {status_code} is out of range 100–599"));
     }
     let probability: f64 = if parts.len() == 2 {
-        parts[1]
-            .parse()
-            .map_err(|_| format!("invalid probability {:?}; expected a float like 0.5", parts[1]))?
+        parts[1].parse().map_err(|_| {
+            format!(
+                "invalid probability {:?}; expected a float like 0.5",
+                parts[1]
+            )
+        })?
     } else {
         1.0
     };
     if !(0.0..=1.0).contains(&probability) {
-        return Err(format!(
-            "probability {probability} is out of range 0.0–1.0"
-        ));
+        return Err(format!("probability {probability} is out of range 0.0–1.0"));
     }
     Ok(FaultRule::Error {
         status_code,
@@ -130,10 +132,10 @@ fn parse_error(rest: &str) -> Result<FaultRule, String> {
 
 /// Split a trailing URL pattern (`:/<path>`) from the rest of a spec segment.
 fn split_url_suffix(s: &str) -> (&str, Option<String>) {
-    if let Some(pos) = s.rfind(':') {
-        if s[pos + 1..].starts_with('/') {
-            return (&s[..pos], Some(s[pos + 1..].to_string()));
-        }
+    if let Some(pos) = s.rfind(':')
+        && s[pos + 1..].starts_with('/')
+    {
+        return (&s[..pos], Some(s[pos + 1..].to_string()));
     }
     (s, None)
 }
@@ -164,20 +166,38 @@ mod tests {
     #[test]
     fn parse_fixed_delay() {
         let r = parse_fault_spec("delay:200ms").unwrap();
-        assert!(matches!(r, FaultRule::Delay { min_ms: 200, max_ms: 200, url_pattern: None }));
+        assert!(matches!(
+            r,
+            FaultRule::Delay {
+                min_ms: 200,
+                max_ms: 200,
+                url_pattern: None
+            }
+        ));
     }
 
     #[test]
     fn parse_range_delay() {
         let r = parse_fault_spec("delay:100ms-500ms").unwrap();
-        assert!(matches!(r, FaultRule::Delay { min_ms: 100, max_ms: 500, url_pattern: None }));
+        assert!(matches!(
+            r,
+            FaultRule::Delay {
+                min_ms: 100,
+                max_ms: 500,
+                url_pattern: None
+            }
+        ));
     }
 
     #[test]
     fn parse_delay_with_url() {
         let r = parse_fault_spec("delay:200ms:/api/users").unwrap();
         match r {
-            FaultRule::Delay { min_ms: 200, max_ms: 200, url_pattern: Some(p) } => {
+            FaultRule::Delay {
+                min_ms: 200,
+                max_ms: 200,
+                url_pattern: Some(p),
+            } => {
                 assert_eq!(p, "/api/users");
             }
             _ => panic!("unexpected rule"),
@@ -187,14 +207,24 @@ mod tests {
     #[test]
     fn parse_error_always() {
         let r = parse_fault_spec("error:503").unwrap();
-        assert!(matches!(r, FaultRule::Error { status_code: 503, .. }));
+        assert!(matches!(
+            r,
+            FaultRule::Error {
+                status_code: 503,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn parse_error_probability() {
         let r = parse_fault_spec("error:500:0.1").unwrap();
         match r {
-            FaultRule::Error { status_code: 500, probability, url_pattern: None } => {
+            FaultRule::Error {
+                status_code: 500,
+                probability,
+                url_pattern: None,
+            } => {
                 assert!((probability - 0.1).abs() < 1e-9);
             }
             _ => panic!("unexpected rule"),
@@ -205,7 +235,11 @@ mod tests {
     fn parse_error_probability_and_url() {
         let r = parse_fault_spec("error:500:0.5:/api").unwrap();
         match r {
-            FaultRule::Error { status_code: 500, probability, url_pattern: Some(p) } => {
+            FaultRule::Error {
+                status_code: 500,
+                probability,
+                url_pattern: Some(p),
+            } => {
                 assert!((probability - 0.5).abs() < 1e-9);
                 assert_eq!(p, "/api");
             }
