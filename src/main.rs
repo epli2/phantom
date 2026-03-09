@@ -18,6 +18,10 @@ use serde::Serialize;
 /// Written to a temp file when tracing Node.js processes via `phantom -- node …`.
 const NODE_PROXY_PRELOAD: &str = include_str!("../tests/apps/node-app/proxy-preload.js");
 
+/// The Java Agent JAR, embedded at compile time.
+/// Written to a temp file when tracing Java processes via `phantom -- java …`.
+const JAVA_AGENT_JAR: &[u8] = include_bytes!("../crates/phantom-java-agent/phantom-java-agent.jar");
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
 // ─────────────────────────────────────────────────────────────────────────────
@@ -411,22 +415,6 @@ fn is_java_command(exe: &str) -> bool {
     base == "java" || base == "javaw"
 }
 
-/// Returns the path to the phantom Java Agent JAR if it exists in the build output.
-fn find_java_agent_jar() -> Option<PathBuf> {
-    // Check common build locations relative to the executable.
-    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-
-    let candidates = [
-        // Development: crates/phantom-java-agent/phantom-java-agent.jar
-        PathBuf::from("crates/phantom-java-agent/phantom-java-agent.jar"),
-        // Relative to binary in target/debug/ or target/release/
-        exe_dir.join("../../../crates/phantom-java-agent/phantom-java-agent.jar"),
-        exe_dir.join("phantom-java-agent.jar"),
-    ];
-
-    candidates.into_iter().find(|path| path.exists())
-}
-
 /// Spawns `command` as a child process routed through the phantom proxy.
 ///
 /// * `HTTP_PROXY` / `http_proxy` are set so plain HTTP is captured.
@@ -445,13 +433,16 @@ fn spawn_proxy_child(
     let exe = &command[0];
     let proxy_url = format!("http://127.0.0.1:{proxy_port}");
 
-    let (actual_args, temp_script): (Vec<String>, Option<TempScript>) = if is_node_command(exe) {
+    let mut temp_script: Option<TempScript> = None;
+    let mut actual_args = command[1..].to_vec();
+
+    if is_node_command(exe) {
         // Write the embedded preload script to a temp file.
         let script_path =
             std::env::temp_dir().join(format!("phantom-preload-{}.js", std::process::id()));
         std::fs::write(&script_path, NODE_PROXY_PRELOAD)
             .map_err(|e| anyhow::anyhow!("failed to write proxy preload script: {e}"))?;
-        let ts = TempScript(script_path.clone());
+        temp_script = Some(TempScript(script_path.clone()));
 
         // Prepend --require <script> before the rest of the args.
         let mut args = vec![
@@ -459,10 +450,8 @@ fn spawn_proxy_child(
             script_path.to_string_lossy().into_owned(),
         ];
         args.extend_from_slice(&command[1..]);
-        (args, Some(ts))
-    } else {
-        (command[1..].to_vec(), None)
-    };
+        actual_args = args;
+    }
 
     let mut cmd = std::process::Command::new(exe);
     cmd.args(&actual_args)
@@ -471,15 +460,20 @@ fn spawn_proxy_child(
 
     // For Java processes, inject proxy settings and the Java Agent via JAVA_TOOL_OPTIONS.
     if is_java_command(exe) {
-        let mut jvm_opts = format!(
-            " -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={proxy_port} -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={proxy_port} -Dhttp.nonProxyHosts= -Dhttps.nonProxyHosts="
-        );
+        // Write the embedded Java Agent to a temp file.
+        let agent_path =
+            std::env::temp_dir().join(format!("phantom-agent-{}.jar", std::process::id()));
+        std::fs::write(&agent_path, JAVA_AGENT_JAR)
+            .map_err(|e| anyhow::anyhow!("failed to write java agent jar: {e}"))?;
+        temp_script = Some(TempScript(agent_path.clone()));
 
-        // Inject Java Agent if found to force proxy and bypass SSL verification.
-        if let Some(agent_path) = find_java_agent_jar() {
-            let agent_arg = format!(" -javaagent:{}", agent_path.display());
-            jvm_opts.push_str(&agent_arg);
-        }
+        let jvm_opts = format!(
+            " -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={proxy_port} \
+              -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={proxy_port} \
+              -Dhttp.nonProxyHosts= -Dhttps.nonProxyHosts= \
+              -javaagent:{}",
+            agent_path.display()
+        );
 
         let existing = std::env::var("JAVA_TOOL_OPTIONS").unwrap_or_default();
         cmd.env("JAVA_TOOL_OPTIONS", format!("{existing}{jvm_opts}"));
