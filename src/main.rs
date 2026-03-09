@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use clap::{Parser, ValueEnum};
-use phantom_capture::ProxyCaptureBackend;
+use phantom_capture::{FaultConfig, ProxyCaptureBackend};
 use phantom_core::capture::CaptureBackend;
 use phantom_core::storage::TraceStore;
 use phantom_core::trace::HttpTrace;
@@ -172,6 +172,22 @@ struct Cli {
     /// Then pass:  --agent-lib ./target/debug/libphantom_agent.so
     #[arg(long, value_name = "PATH")]
     agent_lib: Option<PathBuf>,
+
+    /// Inject faults into proxied requests (proxy backend only).
+    ///
+    /// SPEC formats:
+    ///   delay:100ms              fixed 100 ms delay on all requests
+    ///   delay:100ms-500ms        random delay in the given range
+    ///   delay:200ms:/api         delay only URLs containing "/api"
+    ///   error:503                return HTTP 503 for all requests
+    ///   error:503:0.5            return HTTP 503 with 50% probability
+    ///   error:500:0.1:/api       10% chance of HTTP 500 on URLs containing "/api"
+    ///
+    /// Rules are applied in order; delays and errors can be combined.
+    /// Repeat the flag to add multiple rules:
+    ///   --fault delay:50ms --fault error:500:0.1
+    #[arg(long, value_name = "SPEC")]
+    fault: Vec<String>,
 
     /// Command to spawn and trace (everything after `--`).
     ///
@@ -351,6 +367,20 @@ async fn main() -> anyhow::Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Fault injection
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn build_fault_config(specs: &[String]) -> anyhow::Result<FaultConfig> {
+    let mut rules = Vec::new();
+    for spec in specs {
+        let rule = phantom_capture::parse_fault_spec(spec)
+            .map_err(|e| anyhow::anyhow!("--fault {spec:?}: {e}"))?;
+        rules.push(rule);
+    }
+    Ok(FaultConfig { rules })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Proxy backend
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -418,7 +448,8 @@ fn spawn_proxy_child(
 }
 
 async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
-    let mut backend = ProxyCaptureBackend::new(cli.port, cli.insecure);
+    let fault_config = build_fault_config(&cli.fault)?;
+    let mut backend = ProxyCaptureBackend::new(cli.port, cli.insecure).with_faults(fault_config);
     let backend_name = backend.name().to_string();
     let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
