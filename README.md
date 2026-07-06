@@ -73,7 +73,7 @@ Each line is one completed request/response pair:
 {"timestamp_ms":1783340616458,"duration_ms":12,"method":"GET","url":"https://api.example.com/users","status_code":200,"request_headers":{"…":"…"},"response_headers":{"…":"…"},"response_body":"…","protocol_version":"HTTP/1.1","trace_id":"13a7…","span_id":"3699…"}
 ```
 
-Full field reference: `phantom --help` (JSONL record schema section) or [AGENTS.md](AGENTS.md#jsonl-output-schema).
+Full field reference and compatibility policy: [docs/jsonl-schema.md](docs/jsonl-schema.md).
 
 ## CLI
 

@@ -135,24 +135,16 @@ When the command after `--` is `node` or `nodejs`, phantom automatically:
 
 ## JSONL Output Schema
 
-When `--output jsonl` is used, one JSON object is written per line to stdout. All fields are always present unless marked optional.
+When `--output jsonl` is used, one JSON object is written per line to stdout.
+**Full field reference and compatibility policy: [`docs/jsonl-schema.md`](docs/jsonl-schema.md)** — this
+is the single source of truth; keep it, not a copy of its table, up to date here.
 
-| Field | Type | Description |
-|---|---|---|
-| `trace_id` | string | W3C-compatible 128-bit trace ID (hex, 32 chars) |
-| `span_id` | string | 64-bit span ID (hex, 16 chars) |
-| `timestamp_ms` | number | Unix epoch milliseconds — request start time |
-| `duration_ms` | number | Round-trip latency in milliseconds |
-| `method` | string | HTTP verb: `"GET"`, `"POST"`, `"PUT"`, `"DELETE"`, … |
-| `url` | string | Full request URL (scheme + host + path + query) |
-| `status_code` | number | HTTP response status code |
-| `protocol_version` | string | HTTP version string, e.g. `"HTTP/1.1"` |
-| `request_headers` | object | Lower-cased header names → values |
-| `response_headers` | object | Lower-cased header names → values |
-| `request_body` | string? | UTF-8 decoded body; omitted when empty |
-| `response_body` | string? | UTF-8 decoded body; omitted when empty |
-| `source_addr` | string? | Client socket address, e.g. `"127.0.0.1:54321"` |
-| `dest_addr` | string? | Server socket address, e.g. `"93.184.216.34:443"` |
+Summary: `schema_version` (currently `2`) identifies the record shape; within
+a version, fields are only ever added, never removed/renamed/retyped. Bodies
+carry `*_body_encoding` (`"utf-8"`|`"base64"`), `*_body_truncated`, and
+`*_content_encoding` (set when a compressed body was transparently decoded
+for the record — the wire bytes forwarded to the real client/server are
+never altered).
 
 ---
 

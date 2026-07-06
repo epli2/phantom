@@ -150,4 +150,29 @@ fn test_gzip_response_is_decoded_for_storage_but_wire_is_unmodified() {
         "response_body should be the decoded plaintext JSON"
     );
     assert_eq!(trace["response_body_encoding"].as_str(), Some("utf-8"));
+
+    // ── docs/jsonl-schema.md field reference: every schema_version 2 field
+    // must be present on every record (optional fields may be `null`/absent
+    // only per that document's rules; the required ones below never are).
+    assert_eq!(trace["schema_version"], 2, "schema_version must be 2");
+    for field in [
+        "schema_version",
+        "trace_id",
+        "span_id",
+        "timestamp_ms",
+        "duration_ms",
+        "method",
+        "url",
+        "status_code",
+        "protocol_version",
+        "request_headers",
+        "response_headers",
+        "request_body_truncated",
+        "response_body_truncated",
+    ] {
+        assert!(
+            !trace[field].is_null(),
+            "required JSONL field {field:?} missing from record: {trace}"
+        );
+    }
 }

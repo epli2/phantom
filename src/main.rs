@@ -83,21 +83,18 @@ The target application requires NO code changes.\n\
   jsonl — One JSON object per line on stdout.  phantom exits automatically\n\
           when the child process exits (ideal for scripting and AI agents).\n\
 \n\
-  JSONL record schema (all fields always present unless marked optional):\n\
-    trace_id          string   W3C-compatible 128-bit trace ID (hex, 32 chars)\n\
-    span_id           string   64-bit span ID (hex, 16 chars)\n\
-    timestamp_ms      number   Unix epoch milliseconds — request start time\n\
-    duration_ms       number   Round-trip latency in milliseconds\n\
-    method            string   HTTP verb: \"GET\", \"POST\", \"PUT\", \"DELETE\", …\n\
-    url               string   Full request URL (scheme + host + path + query)\n\
-    status_code       number   HTTP response status code (200, 404, 500, …)\n\
-    protocol_version  string   HTTP version string, e.g. \"HTTP/1.1\"\n\
-    request_headers   object   Lower-cased header names → values\n\
-    response_headers  object   Lower-cased header names → values\n\
-    request_body      string?  UTF-8 decoded body; omitted when empty\n\
-    response_body     string?  UTF-8 decoded body; omitted when empty\n\
-    source_addr       string?  Client socket address, e.g. \"127.0.0.1:54321\"\n\
-    dest_addr         string?  Server socket address, e.g. \"93.184.216.34:443\"",
+  JSONL record (schema_version 2 — additive-only within a version):\n\
+    trace_id, span_id           W3C-compatible trace/span IDs (hex)\n\
+    timestamp_ms, duration_ms   Request start time and round-trip latency\n\
+    method, url, status_code, protocol_version\n\
+    request_headers, response_headers            Lower-cased header maps\n\
+    request_body, response_body                  Omitted when empty\n\
+    *_body_encoding              \"utf-8\" or \"base64\" (binary bodies)\n\
+    *_body_truncated              true if cut off at --max-body\n\
+    *_content_encoding            original Content-Encoding, if decoded\n\
+    source_addr, dest_addr        Socket addresses, if available\n\
+\n\
+  Full field reference: docs/jsonl-schema.md",
     after_long_help = "EXAMPLES\n\
 \n\
   ┌─ Proxy mode (default) ──────────────────────────────────────────────────┐\n\
