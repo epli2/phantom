@@ -229,6 +229,14 @@ struct RunArgs {
     #[arg(long, value_name = "PATH")]
     agent_lib: Option<PathBuf>,
 
+    /// Maximum size of request/response bodies to capture and store.
+    ///
+    /// Accepts a plain byte count or a suffix: "512kb", "1mb", "2gb".
+    /// Use "0" for unlimited. Bodies larger than this are truncated (marked
+    /// with request_body_truncated / response_body_truncated in output).
+    #[arg(long, default_value = "1mb", value_parser = parse_body_size, value_name = "SIZE")]
+    max_body: usize,
+
     /// Inject faults into proxied requests (proxy backend only).
     ///
     /// SPEC formats:
@@ -254,6 +262,31 @@ struct RunArgs {
     command: Vec<String>,
 }
 
+/// Parse a body-size flag value: a plain byte count, or a number with a
+/// "kb"/"mb"/"gb" suffix (case-insensitive). `"0"` means unlimited.
+fn parse_body_size(s: &str) -> Result<usize, String> {
+    let trimmed = s.trim();
+    if trimmed == "0" {
+        return Ok(0);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let (num_str, mult): (&str, usize) = if let Some(n) = lower.strip_suffix("kb") {
+        (n, 1024)
+    } else if let Some(n) = lower.strip_suffix("mb") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("gb") {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let n: usize = num_str.trim().parse().map_err(|_| {
+        format!("invalid size {s:?} (expected e.g. \"1mb\", \"512kb\", or \"0\" for unlimited)")
+    })?;
+    Ok(n * mult)
+}
+
 fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -269,6 +302,9 @@ fn default_data_dir() -> PathBuf {
 /// Emitted as one JSON object per line to stdout in `--output jsonl` mode.
 #[derive(Serialize)]
 struct JsonlTrace {
+    /// JSONL schema version. See docs/jsonl-schema.md for the field reference
+    /// and compatibility policy (same version: additive changes only).
+    schema_version: u32,
     /// Unix timestamp of the request in milliseconds.
     timestamp_ms: u64,
     /// Round-trip duration in milliseconds.
@@ -283,12 +319,30 @@ struct JsonlTrace {
     request_headers: std::collections::HashMap<String, String>,
     /// Response headers (lower-cased keys).
     response_headers: std::collections::HashMap<String, String>,
-    /// Request body decoded as UTF-8 (replacement chars for non-UTF-8 bytes).
+    /// Request body, UTF-8 text or base64 (see `request_body_encoding`).
     #[serde(skip_serializing_if = "Option::is_none")]
     request_body: Option<String>,
-    /// Response body decoded as UTF-8 (replacement chars for non-UTF-8 bytes).
+    /// Response body, UTF-8 text or base64 (see `response_body_encoding`).
     #[serde(skip_serializing_if = "Option::is_none")]
     response_body: Option<String>,
+    /// `"utf-8"` or `"base64"`. Present whenever `request_body` is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_body_encoding: Option<&'static str>,
+    /// `"utf-8"` or `"base64"`. Present whenever `response_body` is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_body_encoding: Option<&'static str>,
+    /// `true` if `request_body` was cut off at the `--max-body` limit.
+    request_body_truncated: bool,
+    /// `true` if `response_body` was cut off at the `--max-body` limit.
+    response_body_truncated: bool,
+    /// Original `Content-Encoding` of the request body, if it was decoded
+    /// for storage (e.g. `"gzip"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_content_encoding: Option<String>,
+    /// Original `Content-Encoding` of the response body, if it was decoded
+    /// for storage (e.g. `"gzip"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_content_encoding: Option<String>,
     /// Source socket address, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     source_addr: Option<String>,
@@ -303,9 +357,26 @@ struct JsonlTrace {
     span_id: String,
 }
 
-fn body_to_str(body: &Option<Vec<u8>>) -> Option<String> {
-    body.as_ref()
-        .map(|b| String::from_utf8_lossy(b).into_owned())
+/// Current JSONL schema version. Bump only for breaking changes; additive
+/// fields do not require a bump. See docs/jsonl-schema.md.
+const JSONL_SCHEMA_VERSION: u32 = 2;
+
+/// Render a body for JSONL: UTF-8 text as-is, binary as base64.
+fn body_to_jsonl(
+    body: &Option<Vec<u8>>,
+    is_binary: bool,
+) -> (Option<String>, Option<&'static str>) {
+    match body {
+        None => (None, None),
+        Some(b) if is_binary => (
+            Some(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b,
+            )),
+            Some("base64"),
+        ),
+        Some(b) => (Some(String::from_utf8_lossy(b).into_owned()), Some("utf-8")),
+    }
 }
 
 fn trace_to_jsonl(t: &HttpTrace) -> JsonlTrace {
@@ -315,7 +386,13 @@ fn trace_to_jsonl(t: &HttpTrace) -> JsonlTrace {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    let (request_body, request_body_encoding) =
+        body_to_jsonl(&t.request_body, t.request_body_binary);
+    let (response_body, response_body_encoding) =
+        body_to_jsonl(&t.response_body, t.response_body_binary);
+
     JsonlTrace {
+        schema_version: JSONL_SCHEMA_VERSION,
         timestamp_ms,
         duration_ms: t.duration.as_millis() as u64,
         method: t.method.to_string(),
@@ -323,8 +400,14 @@ fn trace_to_jsonl(t: &HttpTrace) -> JsonlTrace {
         status_code: t.status_code,
         request_headers: t.request_headers.clone(),
         response_headers: t.response_headers.clone(),
-        request_body: body_to_str(&t.request_body),
-        response_body: body_to_str(&t.response_body),
+        request_body,
+        response_body,
+        request_body_encoding,
+        response_body_encoding,
+        request_body_truncated: t.request_body_truncated,
+        response_body_truncated: t.response_body_truncated,
+        request_content_encoding: t.request_content_encoding.clone(),
+        response_content_encoding: t.response_content_encoding.clone(),
         source_addr: t.source_addr.clone(),
         dest_addr: t.dest_addr.clone(),
         protocol_version: t.protocol_version.clone(),
@@ -734,7 +817,8 @@ async fn run_proxy(args: RunArgs, store: Arc<FjallTraceStore>) -> anyhow::Result
 
     let mut backend = ProxyCaptureBackend::new(args.port, args.insecure)
         .with_faults(fault_config)
-        .with_ca_dir(ca_dir);
+        .with_ca_dir(ca_dir)
+        .with_max_body_size(args.max_body);
     let backend_name = backend.name().to_string();
     let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 

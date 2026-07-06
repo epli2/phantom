@@ -29,6 +29,7 @@ pub struct ProxyCaptureBackend {
     insecure: bool,
     ca_dir: Option<PathBuf>,
     fault_config: FaultConfig,
+    max_body_size: usize,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -40,6 +41,7 @@ impl ProxyCaptureBackend {
             insecure,
             ca_dir: None,
             fault_config: FaultConfig::default(),
+            max_body_size: MAX_BODY_SIZE,
             shutdown_tx: None,
             task_handle: None,
         }
@@ -58,6 +60,13 @@ impl ProxyCaptureBackend {
         self.ca_dir = Some(dir);
         self
     }
+
+    /// Set the maximum body size to capture, in bytes (builder pattern).
+    /// `0` means unlimited. Defaults to 1 MiB.
+    pub fn with_max_body_size(mut self, max_body_size: usize) -> Self {
+        self.max_body_size = max_body_size;
+        self
+    }
 }
 
 impl CaptureBackend for ProxyCaptureBackend {
@@ -69,6 +78,7 @@ impl CaptureBackend for ProxyCaptureBackend {
             trace_tx,
             pending: None,
             fault_config: Arc::new(self.fault_config.clone()),
+            max_body_size: self.max_body_size,
         };
 
         let port = self.listen_port;
@@ -270,6 +280,7 @@ struct TraceHandler {
     /// Pending request info, set in handle_request, consumed in handle_response.
     pending: Option<PendingRequest>,
     fault_config: Arc<FaultConfig>,
+    max_body_size: usize,
 }
 
 #[derive(Clone)]
@@ -278,6 +289,9 @@ struct PendingRequest {
     url: String,
     request_headers: HashMap<String, String>,
     request_body: Option<Vec<u8>>,
+    request_content_encoding: Option<String>,
+    request_body_truncated: bool,
+    request_body_binary: bool,
     source_addr: Option<String>,
     timestamp: SystemTime,
     started_at: Instant,
@@ -292,15 +306,24 @@ impl HttpHandler for TraceHandler {
         let url = reconstruct_url(&req);
         let version = format!("{:?}", req.version());
         let headers = extract_headers(req.headers());
+        let content_encoding = headers.get("content-encoding").cloned();
 
         let (parts, body) = req.into_parts();
-        let body_bytes = collect_body(body).await;
+        let collected = collect_body(body, self.max_body_size).await;
+        let body_result = process_body(
+            collected.recorded,
+            content_encoding.as_deref(),
+            self.max_body_size,
+        );
 
         self.pending = Some(PendingRequest {
             method,
             url,
             request_headers: headers,
-            request_body: body_bytes.clone(),
+            request_body: body_result.data,
+            request_content_encoding: body_result.content_encoding,
+            request_body_truncated: collected.truncated || body_result.truncated,
+            request_body_binary: body_result.is_binary,
             source_addr: Some(ctx.client_addr.to_string()),
             timestamp: SystemTime::now(),
             started_at: Instant::now(),
@@ -309,7 +332,9 @@ impl HttpHandler for TraceHandler {
             protocol_version: version,
         });
 
-        let rebuilt = Request::from_parts(parts, body_to_body(body_bytes));
+        // The upstream request must be forwarded byte-for-byte, independent of
+        // any truncation/decoding applied to the recorded copy above.
+        let rebuilt = Request::from_parts(parts, body_to_body(collected.wire_bytes));
 
         // Apply fault injection rules in order.
         let url = self
@@ -347,6 +372,9 @@ impl HttpHandler for TraceHandler {
                                 url: info.url,
                                 request_headers: info.request_headers,
                                 request_body: info.request_body,
+                                request_content_encoding: info.request_content_encoding,
+                                request_body_truncated: info.request_body_truncated,
+                                request_body_binary: info.request_body_binary,
                                 status_code: *status_code,
                                 response_headers: {
                                     let mut h = HashMap::new();
@@ -358,6 +386,9 @@ impl HttpHandler for TraceHandler {
                                     h
                                 },
                                 response_body: Some(fault_body),
+                                response_content_encoding: None,
+                                response_body_truncated: false,
+                                response_body_binary: false,
                                 timestamp: info.timestamp,
                                 duration: info.started_at.elapsed(),
                                 source_addr: info.source_addr,
@@ -387,10 +418,18 @@ impl HttpHandler for TraceHandler {
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
         let (parts, body) = res.into_parts();
         let response_headers = extract_headers(&parts.headers);
+        let content_encoding = response_headers.get("content-encoding").cloned();
         let status_code = parts.status.as_u16();
-        let response_body = collect_body(body).await;
+        let collected = collect_body(body, self.max_body_size).await;
+        let body_result = process_body(
+            collected.recorded,
+            content_encoding.as_deref(),
+            self.max_body_size,
+        );
 
-        let rebuilt = Response::from_parts(parts, body_to_body(response_body.clone()));
+        // The downstream response must be forwarded byte-for-byte (still
+        // compressed, never truncated), independent of the recorded copy.
+        let rebuilt = Response::from_parts(parts, body_to_body(collected.wire_bytes));
 
         if let Some(info) = self.pending.take() {
             let duration = info.started_at.elapsed();
@@ -402,9 +441,15 @@ impl HttpHandler for TraceHandler {
                 url: info.url,
                 request_headers: info.request_headers,
                 request_body: info.request_body,
+                request_content_encoding: info.request_content_encoding,
+                request_body_truncated: info.request_body_truncated,
+                request_body_binary: info.request_body_binary,
                 status_code,
                 response_headers,
-                response_body,
+                response_body: body_result.data,
+                response_content_encoding: body_result.content_encoding,
+                response_body_truncated: collected.truncated || body_result.truncated,
+                response_body_binary: body_result.is_binary,
                 timestamp: info.timestamp,
                 duration,
                 source_addr: info.source_addr,
@@ -468,32 +513,188 @@ fn extract_headers(headers: &http::HeaderMap) -> HashMap<String, String> {
         .collect()
 }
 
-async fn collect_body(body: Body) -> Option<Vec<u8>> {
+/// Wire-exact bytes plus a (possibly truncated) copy to keep for the trace.
+struct CollectedBody {
+    /// Complete, unmodified bytes. Always used to rebuild the request/response
+    /// that continues on to the real destination or back to the client — the
+    /// wire is never altered by recording, truncation, or decoding.
+    wire_bytes: bytes::Bytes,
+    /// Bytes kept for the trace, truncated at `max_body_size` (still encoded
+    /// exactly as received on the wire; decoding happens in [`process_body`]).
+    recorded: Option<Vec<u8>>,
+    /// Whether `recorded` is a truncated prefix of the real body.
+    truncated: bool,
+}
+
+/// Collect a full body from the wire. `max_body_size` bounds only the copy
+/// kept for the trace (`0` means unlimited); the bytes forwarded onward are
+/// always complete.
+async fn collect_body(body: Body, max_body_size: usize) -> CollectedBody {
     use http_body_util::BodyExt;
-    match body.collect().await {
-        Ok(collected) => {
-            let bytes = collected.to_bytes();
-            if bytes.is_empty() {
-                None
-            } else if bytes.len() > MAX_BODY_SIZE {
-                // Truncate large bodies
-                Some(bytes[..MAX_BODY_SIZE].to_vec())
-            } else {
-                Some(bytes.to_vec())
-            }
-        }
-        Err(_) => None,
+    let wire_bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => bytes::Bytes::new(),
+    };
+
+    if wire_bytes.is_empty() {
+        return CollectedBody {
+            wire_bytes,
+            recorded: None,
+            truncated: false,
+        };
+    }
+
+    let (recorded, truncated) = if max_body_size > 0 && wire_bytes.len() > max_body_size {
+        (wire_bytes[..max_body_size].to_vec(), true)
+    } else {
+        (wire_bytes.to_vec(), false)
+    };
+
+    CollectedBody {
+        wire_bytes,
+        recorded: Some(recorded),
+        truncated,
     }
 }
 
-fn body_to_body(data: Option<Vec<u8>>) -> Body {
-    match data {
-        Some(bytes) => {
-            let b: bytes::Bytes = bytes.into();
-            Body::from(http_body_util::Full::new(b))
+/// Outcome of decoding and classifying a recorded body copy.
+struct BodyResult {
+    data: Option<Vec<u8>>,
+    /// Original `Content-Encoding` value, if the body was successfully decoded.
+    content_encoding: Option<String>,
+    /// Set if the decoded body had to be cut off at `max_body_size` (e.g. a
+    /// small compressed body that decompresses to something much larger).
+    truncated: bool,
+    is_binary: bool,
+}
+
+/// Decode `recorded` per the response/request `Content-Encoding` header (if
+/// present and not `identity`), then re-apply `max_body_size` to the decoded
+/// bytes — decompression can expand well past the original wire size — and
+/// classify the result as text or binary.
+fn process_body(
+    recorded: Option<Vec<u8>>,
+    content_encoding_header: Option<&str>,
+    max_body_size: usize,
+) -> BodyResult {
+    let Some(raw) = recorded else {
+        return BodyResult {
+            data: None,
+            content_encoding: None,
+            truncated: false,
+            is_binary: false,
+        };
+    };
+
+    let (mut data, content_encoding) = match content_encoding_header.map(str::trim) {
+        Some(enc) if !enc.is_empty() && !enc.eq_ignore_ascii_case("identity") => {
+            match decode_body(enc, &raw) {
+                Some(decoded) => (decoded, Some(enc.to_string())),
+                None => {
+                    warn!("failed to decode Content-Encoding {enc:?}; storing raw body");
+                    (raw, None)
+                }
+            }
         }
-        None => Body::empty(),
+        _ => (raw, None),
+    };
+
+    let mut truncated = false;
+    if max_body_size > 0 && data.len() > max_body_size {
+        data.truncate(max_body_size);
+        truncated = true;
     }
+
+    let is_binary = is_binary_body(&data);
+
+    BodyResult {
+        data: Some(data),
+        content_encoding,
+        truncated,
+        is_binary,
+    }
+}
+
+/// Decode one `Content-Encoding` compression scheme.
+fn decode_one(encoding: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    match encoding.to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => {
+            use std::io::Read;
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(bytes)
+                .read_to_end(&mut out)
+                .ok()?;
+            Some(out)
+        }
+        "deflate" => {
+            use std::io::Read;
+            // "deflate" is ambiguous in the wild: most servers send a
+            // zlib-wrapped stream, some send raw DEFLATE. Try zlib first.
+            let mut out = Vec::new();
+            if flate2::read::ZlibDecoder::new(bytes)
+                .read_to_end(&mut out)
+                .is_ok()
+            {
+                return Some(out);
+            }
+            out.clear();
+            flate2::read::DeflateDecoder::new(bytes)
+                .read_to_end(&mut out)
+                .ok()?;
+            Some(out)
+        }
+        "br" => {
+            let mut out = Vec::new();
+            brotli::BrotliDecompress(&mut std::io::Cursor::new(bytes), &mut out).ok()?;
+            Some(out)
+        }
+        "zstd" => zstd::stream::decode_all(bytes).ok(),
+        "identity" => Some(bytes.to_vec()),
+        _ => None,
+    }
+}
+
+/// Decode a `Content-Encoding` chain (e.g. `"gzip, br"`), applied right to
+/// left per HTTP semantics (the last-listed encoding was applied first).
+/// Returns `None` if any step fails, so the caller can fall back to the raw
+/// bytes rather than corrupting or losing the body.
+fn decode_body(encoding_header: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    let tokens: Vec<&str> = encoding_header
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut current = bytes.to_vec();
+    for enc in tokens.iter().rev() {
+        current = decode_one(enc, &current)?;
+    }
+    Some(current)
+}
+
+/// Heuristic: a body counts as binary if its first 8 KB contain a NUL byte,
+/// or more than 10% of that sample fails to decode as valid UTF-8.
+fn is_binary_body(bytes: &[u8]) -> bool {
+    let sample_len = bytes.len().min(8192);
+    let sample = &bytes[..sample_len];
+    if sample_len == 0 {
+        return false;
+    }
+    if sample.contains(&0u8) {
+        return true;
+    }
+    if std::str::from_utf8(sample).is_ok() {
+        return false;
+    }
+    let lossy = String::from_utf8_lossy(sample);
+    let replacement_count = lossy.matches('\u{FFFD}').count();
+    (replacement_count as f64 / sample_len as f64) > 0.10
+}
+
+fn body_to_body(data: bytes::Bytes) -> Body {
+    Body::from(http_body_util::Full::new(data))
 }
 
 fn rand_bytes<const N: usize>() -> [u8; N] {
@@ -648,5 +849,106 @@ mod tests {
             cert_before,
             "cert rewritten for the new key"
         );
+    }
+
+    // ── Content-Encoding decoding ────────────────────────────────────────
+
+    #[test]
+    fn test_decode_body_gzip_roundtrip() {
+        use std::io::Write;
+        let original = b"{\"hello\":\"world\"}".to_vec();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decoded = decode_body("gzip", &compressed).expect("gzip decode should succeed");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_decode_body_corrupt_gzip_does_not_panic() {
+        let garbage = b"this is not gzip data at all".to_vec();
+        assert!(decode_body("gzip", &garbage).is_none());
+    }
+
+    #[test]
+    fn test_decode_body_zstd_roundtrip() {
+        let original = b"the quick brown fox jumps over the lazy dog".to_vec();
+        let compressed = zstd::stream::encode_all(&original[..], 0).unwrap();
+        let decoded = decode_body("zstd", &compressed).expect("zstd decode should succeed");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_decode_body_brotli_roundtrip() {
+        let original = b"phantom brotli test payload".to_vec();
+        let mut compressed = Vec::new();
+        let params = brotli::enc::BrotliEncoderParams::default();
+        brotli::BrotliCompress(
+            &mut std::io::Cursor::new(&original),
+            &mut compressed,
+            &params,
+        )
+        .unwrap();
+        let decoded = decode_body("br", &compressed).expect("brotli decode should succeed");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_decode_body_unknown_encoding_returns_none() {
+        assert!(decode_body("compress", b"whatever").is_none());
+    }
+
+    #[test]
+    fn test_process_body_truncates_after_decode() {
+        // A small compressed payload that decompresses to something larger
+        // than max_body_size must be truncated post-decode, not rejected.
+        let original = vec![b'a'; 10_000];
+        let compressed = zstd::stream::encode_all(&original[..], 0).unwrap();
+        assert!(compressed.len() < 100, "fixture should compress well");
+
+        let result = process_body(Some(compressed), Some("zstd"), 100);
+        assert!(result.truncated, "decoded body should be marked truncated");
+        assert_eq!(result.data.as_ref().unwrap().len(), 100);
+        assert_eq!(result.content_encoding.as_deref(), Some("zstd"));
+    }
+
+    #[test]
+    fn test_process_body_no_encoding_passes_through() {
+        let result = process_body(Some(b"plain text".to_vec()), None, 1024);
+        assert_eq!(result.data.as_deref(), Some(b"plain text".as_slice()));
+        assert_eq!(result.content_encoding, None);
+        assert!(!result.truncated);
+        assert!(!result.is_binary);
+    }
+
+    #[test]
+    fn test_process_body_identity_passes_through() {
+        let result = process_body(Some(b"plain text".to_vec()), Some("identity"), 1024);
+        assert_eq!(result.data.as_deref(), Some(b"plain text".as_slice()));
+        assert_eq!(result.content_encoding, None);
+    }
+
+    // ── Binary detection ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_binary_body_detects_nul_bytes() {
+        assert!(is_binary_body(b"\x00\x01\x02binary"));
+    }
+
+    #[test]
+    fn test_is_binary_body_detects_invalid_utf8() {
+        let mostly_invalid: Vec<u8> = (0..200).map(|_| 0xFFu8).collect();
+        assert!(is_binary_body(&mostly_invalid));
+    }
+
+    #[test]
+    fn test_is_binary_body_allows_plain_text() {
+        assert!(!is_binary_body("hello, world! こんにちは".as_bytes()));
+    }
+
+    #[test]
+    fn test_is_binary_body_empty_is_not_binary() {
+        assert!(!is_binary_body(b""));
     }
 }

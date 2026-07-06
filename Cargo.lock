@@ -191,13 +191,34 @@ dependencies = [
 
 [[package]]
 name = "brotli"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74f7971dbd9326d58187408ab83117d8ac1bb9c17b085fdacd1cf2f598719b6b"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
+ "brotli-decompressor 4.0.3",
+]
+
+[[package]]
+name = "brotli"
 version = "8.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4bd8b9603c7aa97359dbd97ecf258968c95f3adddd6db2f7e7a5bef101c84560"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
- "brotli-decompressor",
+ "brotli-decompressor 5.0.0",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a334ef7c9e23abf0ce748e8cd309037da93e606ad52eb372e4ce327a0dcfbdfd"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
 ]
 
 [[package]]
@@ -356,7 +377,7 @@ version = "0.4.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb7b51a7d9c967fc26773061ba86150f19c50c0d65c887cb1fbe295fd16619b7"
 dependencies = [
- "brotli",
+ "brotli 8.0.2",
  "compression-core",
  "flate2",
  "memchr",
@@ -1605,9 +1626,11 @@ name = "phantom"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "cargo-husky",
  "clap",
  "dirs",
+ "flate2",
  "phantom-capture",
  "phantom-core",
  "phantom-storage",
@@ -1640,7 +1663,9 @@ name = "phantom-capture"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "brotli 6.0.0",
  "bytes",
+ "flate2",
  "http",
  "http-body-util",
  "hudsucker",
@@ -1655,6 +1680,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

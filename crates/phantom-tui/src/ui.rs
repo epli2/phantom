@@ -215,7 +215,16 @@ fn render_trace_detail(frame: &mut Frame, app: &App, area: Rect) {
             "Body:",
             Style::default().fg(Color::DarkGray),
         )));
-        append_body_lines(&mut lines, body);
+        append_body_lines(
+            &mut lines,
+            body,
+            trace.request_body_truncated,
+            trace.request_body_binary,
+            trace
+                .request_headers
+                .get("content-type")
+                .map(String::as_str),
+        );
     }
 
     lines.push(Line::from(""));
@@ -266,7 +275,16 @@ fn render_trace_detail(frame: &mut Frame, app: &App, area: Rect) {
             "Body:",
             Style::default().fg(Color::DarkGray),
         )));
-        append_body_lines(&mut lines, body);
+        append_body_lines(
+            &mut lines,
+            body,
+            trace.response_body_truncated,
+            trace.response_body_binary,
+            trace
+                .response_headers
+                .get("content-type")
+                .map(String::as_str),
+        );
     }
 
     let detail = Paragraph::new(Text::from(lines))
@@ -335,10 +353,23 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-fn append_body_lines(lines: &mut Vec<Line>, body: &[u8]) {
-    if let Ok(text) = std::str::from_utf8(body) {
+fn append_body_lines(
+    lines: &mut Vec<Line>,
+    body: &[u8],
+    truncated: bool,
+    is_binary: bool,
+    content_type: Option<&str>,
+) {
+    if is_binary {
+        let ct = content_type.unwrap_or("application/octet-stream");
+        lines.push(Line::from(Span::styled(
+            format!("[binary body, {}, {ct}]", human_size(body.len())),
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let text = String::from_utf8_lossy(body);
         // Try pretty-printing JSON
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text)
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
             && let Ok(pretty) = serde_json::to_string_pretty(&json)
         {
             for line in pretty.lines().take(30) {
@@ -347,16 +378,39 @@ fn append_body_lines(lines: &mut Vec<Line>, body: &[u8]) {
                     Style::default().fg(Color::White),
                 )));
             }
-            return;
+        } else {
+            for line in text.lines().take(30) {
+                lines.push(Line::from(line.to_string()));
+            }
         }
-        // Plain text
-        for line in text.lines().take(30) {
-            lines.push(Line::from(line.to_string()));
-        }
-    } else {
+    }
+
+    if truncated {
         lines.push(Line::from(Span::styled(
-            format!("<binary, {} bytes>", body.len()),
-            Style::default().fg(Color::DarkGray),
+            format!(
+                "[body truncated at {} — rerun with --max-body 0]",
+                human_size(body.len())
+            ),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
+    }
+}
+
+/// Format a byte count as a human-readable size (e.g. "1.0 MB", "24.3 KB").
+fn human_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
     }
 }

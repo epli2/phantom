@@ -89,11 +89,31 @@ pub struct HttpTrace {
     pub url: String,
     pub request_headers: HashMap<String, String>,
     pub request_body: Option<Vec<u8>>,
+    /// Original `Content-Encoding` of the request body, if it was transparently
+    /// decoded for storage (e.g. `"gzip"`). `None` if the body was stored as-is.
+    #[serde(default)]
+    pub request_content_encoding: Option<String>,
+    /// `true` if `request_body` was cut off at the configured size limit.
+    #[serde(default)]
+    pub request_body_truncated: bool,
+    /// `true` if `request_body` looks like binary data (not valid UTF-8 text).
+    #[serde(default)]
+    pub request_body_binary: bool,
 
     // -- Response --
     pub status_code: u16,
     pub response_headers: HashMap<String, String>,
     pub response_body: Option<Vec<u8>>,
+    /// Original `Content-Encoding` of the response body, if it was transparently
+    /// decoded for storage (e.g. `"gzip"`). `None` if the body was stored as-is.
+    #[serde(default)]
+    pub response_content_encoding: Option<String>,
+    /// `true` if `response_body` was cut off at the configured size limit.
+    #[serde(default)]
+    pub response_body_truncated: bool,
+    /// `true` if `response_body` looks like binary data (not valid UTF-8 text).
+    #[serde(default)]
+    pub response_body_binary: bool,
 
     // -- Timing --
     pub timestamp: SystemTime,
