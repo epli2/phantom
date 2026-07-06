@@ -15,6 +15,13 @@ fn main() {
     // 1. Check for javac and jar
     if Command::new("javac").arg("-version").output().is_err() {
         println!("cargo:warning=javac not found. Skipping Java Agent build.");
+        // src/main.rs embeds this file unconditionally via include_bytes!, so it
+        // must exist even when the JDK is unavailable (e.g. CI/Docker images
+        // without a JDK). An empty placeholder keeps the base binary
+        // buildable; `-javaagent` support requires rebuilding with a JDK.
+        if !jar_file.exists() {
+            fs::write(&jar_file, []).expect("failed to write placeholder java agent jar");
+        }
         return;
     }
 
