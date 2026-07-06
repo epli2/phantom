@@ -1,9 +1,10 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use clap::{Parser, ValueEnum};
-use phantom_capture::{FaultConfig, ProxyCaptureBackend};
+use clap::{Parser, Subcommand, ValueEnum};
+use phantom_capture::{CaPaths, FaultConfig, ProxyCaptureBackend};
 use phantom_core::capture::CaptureBackend;
 use phantom_core::storage::TraceStore;
 use phantom_core::trace::HttpTrace;
@@ -144,9 +145,60 @@ The target application requires NO code changes.\n\
     | jq '{method,url,status_code,duration_ms}' # compact summary\n\
 \n\
   └─────────────────────────────────────────────────────────────────────────┘",
-    version
+    version,
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Capture traffic from a target process (default when no subcommand is given).
+    ///
+    /// `phantom run -- node app.js` and the legacy `phantom -- node app.js`
+    /// are equivalent; see `phantom --help` for the full capture guide.
+    Run(RunArgs),
+    /// Manage the CA certificate used for HTTPS interception.
+    ///
+    /// The CA is generated once and persisted under <DATA_DIR>/ca. Clients
+    /// spawned via `phantom -- CMD` trust it automatically through environment
+    /// variables (CURL_CA_BUNDLE, NODE_EXTRA_CA_CERTS, …); use this command to
+    /// trust it from apps that phantom does not spawn (e.g. browsers).
+    Cert(CertArgs),
+}
+
+#[derive(clap::Args)]
+struct CertArgs {
+    /// Directory where phantom stores data (the CA lives in <DIR>/ca).
+    /// Defaults to the platform data directory, e.g. ~/.local/share/phantom/data.
+    #[arg(short, long)]
+    data_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    action: CertAction,
+}
+
+#[derive(Subcommand)]
+enum CertAction {
+    /// Print the absolute path of the CA certificate (PEM).
+    Path,
+    /// Print the CA certificate PEM to stdout.
+    Print,
+    /// Copy the CA certificate to a file and show OS trust-store instructions.
+    Export {
+        /// Output file path.
+        #[arg(long, default_value = "phantom-ca.cert.pem")]
+        out: PathBuf,
+    },
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
     /// Capture backend: 'proxy' (MITM, cross-platform) or 'ldpreload' (Linux, plain HTTP only).
     #[arg(short, long, value_enum, default_value = "proxy")]
     backend: Backend,
@@ -358,16 +410,63 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
+    // Subcommand-less invocation (`phantom -- node app.js`) behaves exactly
+    // like `phantom run -- node app.js` for backward compatibility.
+    let args = match cli.command {
+        Some(Command::Cert(cert)) => return run_cert(cert),
+        Some(Command::Run(run)) => run,
+        None => cli.run,
+    };
+
+    let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)?;
 
     let store = Arc::new(FjallTraceStore::open(&data_dir)?);
 
-    match cli.backend {
-        Backend::Proxy => run_proxy(cli, store).await,
+    match args.backend {
+        Backend::Proxy => run_proxy(args, store).await,
         #[cfg(target_os = "linux")]
-        Backend::Ldpreload => run_ldpreload(cli, store).await,
+        Backend::Ldpreload => run_ldpreload(args, store).await,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cert subcommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn run_cert(args: CertArgs) -> anyhow::Result<()> {
+    let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
+    let ca_dir = data_dir.join("ca");
+    let ca = phantom_capture::ensure_ca(&ca_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    match args.action {
+        CertAction::Path => println!("{}", ca.cert_path.display()),
+        CertAction::Print => print!("{}", std::fs::read_to_string(&ca.cert_path)?),
+        CertAction::Export { out } => {
+            std::fs::copy(&ca.cert_path, &out)
+                .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", out.display()))?;
+            eprintln!("phantom: CA certificate exported to {}", out.display());
+            eprintln!();
+            eprintln!("Processes spawned via `phantom -- CMD` trust this CA automatically.");
+            eprintln!("To trust it system-wide (for apps phantom does not spawn):");
+            eprintln!();
+            eprintln!("  macOS:");
+            eprintln!("    sudo security add-trusted-cert -d -r trustRoot \\");
+            eprintln!(
+                "      -k /Library/Keychains/System.keychain {}",
+                out.display()
+            );
+            eprintln!("  Ubuntu/Debian:");
+            eprintln!(
+                "    sudo cp {} /usr/local/share/ca-certificates/phantom-ca.crt",
+                out.display()
+            );
+            eprintln!("    sudo update-ca-certificates");
+            eprintln!("  Windows (PowerShell, admin):");
+            eprintln!("    certutil -addstore -f ROOT {}", out.display());
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -415,9 +514,76 @@ fn is_java_command(exe: &str) -> bool {
     base == "java" || base == "javaw"
 }
 
+/// Locate the baseline CA roots to include in the combined phantom bundle:
+/// a bundle the user already points at via environment, else the system one.
+fn find_base_ca_bundle() -> Option<PathBuf> {
+    for key in ["CURL_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"] {
+        if let Some(p) = std::env::var_os(key) {
+            let p = PathBuf::from(p);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    [
+        "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",   // Fedora/RHEL
+        "/etc/ssl/ca-bundle.pem",             // openSUSE
+        "/etc/ssl/cert.pem",                  // macOS (LibreSSL), Alpine, BSD
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|p| p.is_file())
+}
+
+/// Write `<ca_dir>/phantom-ca-bundle.pem`: previously trusted roots (user or
+/// system bundle, plus any NODE_EXTRA_CA_CERTS) with the phantom CA appended.
+/// A strict superset of what the child already trusted, so pointing trust
+/// variables at it never *removes* trust — it only adds the phantom CA.
+/// Rebuilt on every start so trust-store updates are picked up.
+fn build_ca_bundle(ca_dir: &Path, ca: &CaPaths) -> anyhow::Result<PathBuf> {
+    let bundle_path = ca_dir.join("phantom-ca-bundle.pem");
+    let mut bundle = String::new();
+
+    let mut append_file = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(pem) => {
+            bundle.push_str(&pem);
+            if !bundle.ends_with('\n') {
+                bundle.push('\n');
+            }
+        }
+        Err(e) => eprintln!("phantom: could not read CA file {}: {e}", path.display()),
+    };
+
+    match find_base_ca_bundle() {
+        Some(base) => append_file(&base),
+        None => eprintln!(
+            "phantom: no system CA bundle found; the traced process will only \
+             trust the phantom CA"
+        ),
+    }
+
+    // Extra CAs the user already gave to Node.js stay trusted.
+    if let Some(extra) = std::env::var_os("NODE_EXTRA_CA_CERTS") {
+        let extra = PathBuf::from(extra);
+        if extra.is_file() {
+            append_file(&extra);
+        }
+    }
+
+    bundle.push_str(&std::fs::read_to_string(&ca.cert_path)?);
+    std::fs::write(&bundle_path, bundle)?;
+
+    Ok(bundle_path)
+}
+
 /// Spawns `command` as a child process routed through the phantom proxy.
 ///
-/// * `HTTP_PROXY` / `http_proxy` are set so plain HTTP is captured.
+/// * `HTTP_PROXY` / `HTTPS_PROXY` (and lowercase variants) are set so both
+///   plain and TLS traffic is captured.
+/// * CA trust variables (CURL_CA_BUNDLE, SSL_CERT_FILE, REQUESTS_CA_BUNDLE,
+///   NODE_EXTRA_CA_CERTS, DENO_CERT) point at the phantom CA so clients can
+///   verify MITM'd certificates without disabling TLS verification.
 /// * For Node.js executables the embedded proxy-preload script is written to a
 ///   temp file and prepended as `--require <path>` so HTTPS is also captured
 ///   without touching the application source.
@@ -429,6 +595,7 @@ fn is_java_command(exe: &str) -> bool {
 fn spawn_proxy_child(
     command: &[String],
     proxy_port: u16,
+    ca_bundle: &Path,
 ) -> anyhow::Result<(std::process::Child, Option<TempScript>)> {
     let exe = &command[0];
     let proxy_url = format!("http://127.0.0.1:{proxy_port}");
@@ -454,11 +621,38 @@ fn spawn_proxy_child(
     }
 
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(&actual_args)
-        .env("HTTP_PROXY", &proxy_url)
-        .env("http_proxy", &proxy_url);
+    cmd.args(&actual_args);
 
-    // For Java processes, inject proxy settings and the Java Agent via JAVA_TOOL_OPTIONS.
+    // Route both plain and TLS traffic through the proxy. These are essential
+    // for capture, so an existing value is overridden (with a notice).
+    //
+    // Node.js is the exception: proxy-preload.js routes HTTPS itself via a
+    // CONNECT tunnel agent. Setting HTTPS_PROXY there would also trigger
+    // axios's own env-based proxying of https:// URLs, which conflicts with
+    // the preload's patched https.request.
+    let proxy_keys: &[&str] = if is_node_command(exe) {
+        &["HTTP_PROXY", "http_proxy"]
+    } else {
+        &["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"]
+    };
+    for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+        if proxy_keys.contains(&key) {
+            if let Some(old) = std::env::var_os(key)
+                && old != *OsStr::new(&proxy_url)
+            {
+                eprintln!("phantom: overriding {key} for the traced process");
+            }
+            cmd.env(key, &proxy_url);
+        } else {
+            // Inherited values must not leak into the child either.
+            cmd.env_remove(key);
+        }
+    }
+
+    // For Java processes, additionally inject proxy settings and the Java
+    // Agent via JAVA_TOOL_OPTIONS. The JVM does not read HTTP_PROXY /
+    // HTTPS_PROXY itself, so this is required for java.net-based clients to
+    // route through phantom at all.
     if is_java_command(exe) {
         // Write the embedded Java Agent to a temp file.
         let agent_path =
@@ -479,6 +673,48 @@ fn spawn_proxy_child(
         cmd.env("JAVA_TOOL_OPTIONS", format!("{existing}{jvm_opts}"));
     }
 
+    // Other inherited proxy variables would make the child bypass phantom
+    // (NO_PROXY) or send traffic to a different proxy (ALL_PROXY, npm_config_*),
+    // silently creating capture blind spots — clear them.
+    for key in [
+        "NO_PROXY",
+        "no_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "npm_config_proxy",
+        "npm_config_http_proxy",
+        "npm_config_https_proxy",
+        "npm_config_no_proxy",
+        "npm_config_noproxy",
+    ] {
+        if std::env::var_os(key).is_some() {
+            eprintln!("phantom: clearing {key} for the traced process");
+        }
+        cmd.env_remove(key);
+    }
+
+    // Point common TLS stacks at the combined bundle (previously trusted
+    // roots + phantom CA) so MITM'd certificates verify without disabling
+    // TLS verification. The bundle is a superset of what was trusted before
+    // (build_ca_bundle folds in any user-set bundle), so overriding is safe.
+    // Java is unaffected by these (it uses the -javaagent trust-all bypass
+    // above instead of these env-based TLS trust stores).
+    for key in [
+        "SSL_CERT_FILE",       // OpenSSL, Ruby, some Go builds
+        "CURL_CA_BUNDLE",      // curl
+        "REQUESTS_CA_BUNDLE",  // Python requests
+        "NODE_EXTRA_CA_CERTS", // Node.js (additive)
+        "DENO_CERT",           // Deno
+    ] {
+        if std::env::var_os(key).is_some() {
+            eprintln!(
+                "phantom: {key} was set; pointing it at the combined phantom CA \
+                 bundle (previous roots included)"
+            );
+        }
+        cmd.env(key, ca_bundle.as_os_str());
+    }
+
     let child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {:?}: {e}", exe))?;
@@ -486,48 +722,59 @@ fn spawn_proxy_child(
     Ok((child, temp_script))
 }
 
-async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
-    let fault_config = build_fault_config(&cli.fault)?;
-    let mut backend = ProxyCaptureBackend::new(cli.port, cli.insecure).with_faults(fault_config);
+async fn run_proxy(args: RunArgs, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
+    let fault_config = build_fault_config(&args.fault)?;
+
+    // Persist the MITM CA under <data-dir>/ca so it survives restarts and can
+    // be trusted by clients (see `phantom cert --help`).
+    let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
+    let ca_dir = data_dir.join("ca");
+    let ca_paths = phantom_capture::ensure_ca(&ca_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ca_bundle = build_ca_bundle(&ca_dir, &ca_paths)?;
+
+    let mut backend = ProxyCaptureBackend::new(args.port, args.insecure)
+        .with_faults(fault_config)
+        .with_ca_dir(ca_dir);
     let backend_name = backend.name().to_string();
     let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Optionally spawn a child command routed through the proxy.
     let child_and_script: Option<(std::process::Child, Option<TempScript>)> =
-        if !cli.command.is_empty() {
+        if !args.command.is_empty() {
             // Wait for the proxy to be ready before spawning the child.
-            wait_for_proxy(cli.port).await?;
-            let (child, ts) = spawn_proxy_child(&cli.command, cli.port)?;
+            wait_for_proxy(args.port).await?;
+            let (child, ts) = spawn_proxy_child(&args.command, args.port, &ca_bundle)?;
             eprintln!(
                 "phantom: spawned PID {} → {}",
                 child.id(),
-                cli.command.join(" ")
+                args.command.join(" ")
             );
             Some((child, ts))
         } else {
             None
         };
 
-    match cli.output {
+    match args.output {
         OutputMode::Tui => {
-            if cli.command.is_empty() {
-                eprintln!("phantom: proxy listening on 127.0.0.1:{}", cli.port);
-                eprintln!("  Set your HTTP proxy to http://127.0.0.1:{}", cli.port);
+            if args.command.is_empty() {
+                eprintln!("phantom: proxy listening on 127.0.0.1:{}", args.port);
+                eprintln!("  Set your HTTP proxy to http://127.0.0.1:{}", args.port);
                 eprintln!(
                     "  Example: curl -x http://127.0.0.1:{} http://httpbin.org/get",
-                    cli.port
+                    args.port
                 );
+                eprintln!("  HTTPS: trust the phantom CA — see `phantom cert export --help`");
             }
             eprintln!(
                 "phantom: traces stored in {}",
-                store_path_display(&cli.data_dir)
+                store_path_display(&args.data_dir)
             );
             phantom_tui::run_tui(store, trace_rx, &backend_name).await?;
         }
         OutputMode::Jsonl => {
             eprintln!(
                 "phantom: proxy listening on 127.0.0.1:{} [jsonl mode]",
-                cli.port
+                args.port
             );
             // Split into child and script guard separately so the TempScript
             // is NOT dropped until after run_jsonl_output completes (the file
@@ -567,17 +814,17 @@ async fn wait_for_proxy(port: u16) -> anyhow::Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
-async fn run_ldpreload(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
+async fn run_ldpreload(args: RunArgs, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
     use phantom_capture::LdPreloadCaptureBackend;
 
-    let agent_lib = cli.agent_lib.clone().ok_or_else(|| {
+    let agent_lib = args.agent_lib.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "--agent-lib <PATH> is required for --backend ldpreload\n\
             Example: --agent-lib ./target/debug/libphantom_agent.so"
         )
     })?;
 
-    if cli.command.is_empty() {
+    if args.command.is_empty() {
         anyhow::bail!(
             "A command to trace is required for --backend ldpreload.\n\
             Usage: phantom --backend ldpreload --agent-lib ./libphantom_agent.so -- curl http://example.com"
@@ -600,23 +847,23 @@ async fn run_ldpreload(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<
     eprintln!("phantom: ldpreload backend active");
     eprintln!("  agent lib : {}", agent_lib.display());
     eprintln!("  socket    : {}", socket_path.display());
-    eprintln!("  command   : {}", cli.command.join(" "));
+    eprintln!("  command   : {}", args.command.join(" "));
     eprintln!(
         "phantom: traces stored in {}",
-        store_path_display(&cli.data_dir)
+        store_path_display(&args.data_dir)
     );
 
     // Spawn the target process with LD_PRELOAD and PHANTOM_SOCKET set.
-    let child = std::process::Command::new(&cli.command[0])
-        .args(&cli.command[1..])
+    let child = std::process::Command::new(&args.command[0])
+        .args(&args.command[1..])
         .env("LD_PRELOAD", &agent_lib)
         .env("PHANTOM_SOCKET", &socket_path)
         .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn {:?}: {e}", cli.command[0]))?;
+        .map_err(|e| anyhow::anyhow!("failed to spawn {:?}: {e}", args.command[0]))?;
 
     eprintln!("phantom: spawned PID {}", child.id());
 
-    match cli.output {
+    match args.output {
         OutputMode::Tui => {
             // In TUI mode the user quits manually; child runs in background.
             phantom_tui::run_tui(store, trace_rx, &backend_name).await?;

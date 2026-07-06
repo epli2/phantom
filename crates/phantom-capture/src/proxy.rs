@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -19,9 +20,14 @@ use crate::fault::{FaultConfig, FaultRule};
 /// Maximum body size to capture (1 MB).
 const MAX_BODY_SIZE: usize = 1024 * 1024;
 
+/// File names of the persistent CA material inside the CA directory.
+const CA_KEY_FILE: &str = "phantom-ca.key.pem";
+const CA_CERT_FILE: &str = "phantom-ca.cert.pem";
+
 pub struct ProxyCaptureBackend {
     listen_port: u16,
     insecure: bool,
+    ca_dir: Option<PathBuf>,
     fault_config: FaultConfig,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
@@ -32,6 +38,7 @@ impl ProxyCaptureBackend {
         Self {
             listen_port,
             insecure,
+            ca_dir: None,
             fault_config: FaultConfig::default(),
             shutdown_tx: None,
             task_handle: None,
@@ -41,6 +48,14 @@ impl ProxyCaptureBackend {
     /// Attach fault injection rules (builder pattern).
     pub fn with_faults(mut self, config: FaultConfig) -> Self {
         self.fault_config = config;
+        self
+    }
+
+    /// Persist the MITM CA under `dir` so the same CA is reused across runs
+    /// (builder pattern). Without this the CA is ephemeral and regenerated on
+    /// every start, which forces clients to disable TLS verification.
+    pub fn with_ca_dir(mut self, dir: PathBuf) -> Self {
+        self.ca_dir = Some(dir);
         self
     }
 }
@@ -58,9 +73,13 @@ impl CaptureBackend for ProxyCaptureBackend {
 
         let port = self.listen_port;
         let insecure = self.insecure;
+        let ca_dir = self.ca_dir.clone();
 
         let task_handle = tokio::spawn(async move {
-            let (key_pair, ca_cert) = generate_ca();
+            let (key_pair, ca_cert) = match &ca_dir {
+                Some(dir) => load_or_generate_ca(dir),
+                None => generate_ca(),
+            };
             let ca = RcgenAuthority::new(key_pair, ca_cert, 1000);
 
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -115,8 +134,29 @@ impl CaptureBackend for ProxyCaptureBackend {
     }
 }
 
-/// Generate a self-signed CA certificate for HTTPS interception.
-fn generate_ca() -> (KeyPair, hudsucker::rcgen::Certificate) {
+// ─────────────────────────────────────────────────────────────────────────────
+// CA management
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Paths of the persistent CA material managed by [`ensure_ca`].
+#[derive(Debug, Clone)]
+pub struct CaPaths {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+/// Ensure a persistent CA exists under `ca_dir`, generating it on first use,
+/// and return the file paths. Safe to call repeatedly; the CA is only
+/// regenerated when the key file is missing or unreadable.
+pub fn ensure_ca(ca_dir: &Path) -> Result<CaPaths, CaptureError> {
+    try_load_or_generate_ca(ca_dir)?;
+    Ok(CaPaths {
+        cert_path: ca_dir.join(CA_CERT_FILE),
+        key_path: ca_dir.join(CA_KEY_FILE),
+    })
+}
+
+fn build_ca_params() -> CertificateParams {
     use hudsucker::rcgen;
 
     let mut params = CertificateParams::default();
@@ -127,13 +167,98 @@ fn generate_ca() -> (KeyPair, hudsucker::rcgen::Certificate) {
     params
         .distinguished_name
         .push(rcgen::DnType::OrganizationName, "Phantom");
+    params
+}
 
+/// Generate an ephemeral self-signed CA certificate for HTTPS interception.
+/// Used when no CA directory is configured (e.g. library use in tests).
+fn generate_ca() -> (KeyPair, hudsucker::rcgen::Certificate) {
     let key_pair = KeyPair::generate().expect("Failed to generate CA key pair");
-    let ca_cert = params
+    let ca_cert = build_ca_params()
         .self_signed(&key_pair)
         .expect("Failed to self-sign CA certificate");
 
     (key_pair, ca_cert)
+}
+
+/// Load the persistent CA from `ca_dir`, generating it on first use.
+/// Falls back to an ephemeral CA if the directory is unusable, so a broken
+/// filesystem never prevents the proxy from starting.
+fn load_or_generate_ca(ca_dir: &Path) -> (KeyPair, hudsucker::rcgen::Certificate) {
+    match try_load_or_generate_ca(ca_dir) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(
+                "failed to persist CA in {}: {e}; falling back to ephemeral CA",
+                ca_dir.display()
+            );
+            generate_ca()
+        }
+    }
+}
+
+fn try_load_or_generate_ca(
+    ca_dir: &Path,
+) -> Result<(KeyPair, hudsucker::rcgen::Certificate), CaptureError> {
+    let io_err = |e: std::io::Error| CaptureError::StartFailed(format!("CA storage: {e}"));
+
+    std::fs::create_dir_all(ca_dir).map_err(io_err)?;
+    let key_path = ca_dir.join(CA_KEY_FILE);
+    let cert_path = ca_dir.join(CA_CERT_FILE);
+
+    // Keep the private key out of version control if the data dir lives
+    // inside a repository.
+    let gitignore = ca_dir.join(".gitignore");
+    if !gitignore.exists() {
+        std::fs::write(&gitignore, "*\n").map_err(io_err)?;
+    }
+
+    // Load the key pair, regenerating from scratch when missing or corrupt.
+    let (key_pair, fresh_key) = match std::fs::read_to_string(&key_path) {
+        Ok(pem) => match KeyPair::from_pem(&pem) {
+            Ok(kp) => (kp, false),
+            Err(e) => {
+                warn!(
+                    "corrupt CA key at {}: {e}; regenerating CA",
+                    key_path.display()
+                );
+                let kp = KeyPair::generate()
+                    .map_err(|e| CaptureError::StartFailed(format!("CA keygen: {e}")))?;
+                (kp, true)
+            }
+        },
+        Err(_) => {
+            let kp = KeyPair::generate()
+                .map_err(|e| CaptureError::StartFailed(format!("CA keygen: {e}")))?;
+            (kp, true)
+        }
+    };
+
+    if fresh_key {
+        std::fs::write(&key_path, key_pair.serialize_pem()).map_err(io_err)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(io_err)?;
+        }
+        // A cert belonging to a previous key can no longer act as the issuer.
+        let _ = std::fs::remove_file(&cert_path);
+    }
+
+    // Re-sign the CA params with the loaded key on every startup. Trust
+    // anchors are matched by subject DN + public key, so the cert PEM written
+    // on first run remains a valid anchor for leaf certs signed with this key
+    // even though this in-memory certificate object is freshly signed.
+    let ca_cert = build_ca_params()
+        .self_signed(&key_pair)
+        .map_err(|e| CaptureError::StartFailed(format!("CA self-sign: {e}")))?;
+
+    if !cert_path.exists() {
+        std::fs::write(&cert_path, ca_cert.pem()).map_err(io_err)?;
+    }
+
+    Ok((key_pair, ca_cert))
 }
 
 /// Handler is cloned per-connection by hudsucker. Within a single connection,
@@ -448,5 +573,80 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
             rustls::SignatureScheme::RSA_PKCS1_SHA384,
             rustls::SignatureScheme::RSA_PKCS1_SHA256,
         ]
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ensure_ca_creates_files_on_first_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join("ca");
+
+        let paths = ensure_ca(&ca_dir).unwrap();
+
+        assert!(paths.cert_path.exists(), "cert file created");
+        assert!(paths.key_path.exists(), "key file created");
+        assert!(ca_dir.join(".gitignore").exists(), ".gitignore created");
+
+        let cert_pem = std::fs::read_to_string(&paths.cert_path).unwrap();
+        assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&paths.key_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "key file is private");
+        }
+    }
+
+    #[test]
+    fn test_ensure_ca_is_stable_across_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join("ca");
+
+        let paths = ensure_ca(&ca_dir).unwrap();
+        let cert_before = std::fs::read(&paths.cert_path).unwrap();
+        let key_before = std::fs::read(&paths.key_path).unwrap();
+
+        // Second load must reuse the same key and keep the cert file untouched.
+        let (key_pair, _cert) = try_load_or_generate_ca(&ca_dir).unwrap();
+        assert_eq!(std::fs::read(&paths.cert_path).unwrap(), cert_before);
+        assert_eq!(std::fs::read(&paths.key_path).unwrap(), key_before);
+        assert_eq!(
+            key_pair.serialize_pem().as_bytes(),
+            key_before.as_slice(),
+            "loaded key matches the persisted key"
+        );
+    }
+
+    #[test]
+    fn test_ensure_ca_regenerates_on_corrupt_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join("ca");
+
+        let paths = ensure_ca(&ca_dir).unwrap();
+        let cert_before = std::fs::read(&paths.cert_path).unwrap();
+        std::fs::write(&paths.key_path, "not a pem").unwrap();
+
+        let regenerated = ensure_ca(&ca_dir).unwrap();
+        assert!(regenerated.cert_path.exists());
+        assert!(regenerated.key_path.exists());
+        let key_after = std::fs::read_to_string(&regenerated.key_path).unwrap();
+        assert!(key_after.contains("BEGIN PRIVATE KEY"), "key regenerated");
+        assert_ne!(
+            std::fs::read(&regenerated.cert_path).unwrap(),
+            cert_before,
+            "cert rewritten for the new key"
+        );
     }
 }
