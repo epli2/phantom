@@ -11,6 +11,7 @@ use hudsucker::rcgen::{CertificateParams, KeyPair};
 use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 use phantom_core::capture::CaptureBackend;
 use phantom_core::error::CaptureError;
+use phantom_core::redact::{self, RedactionConfig};
 use phantom_core::trace::{HttpMethod, HttpTrace, SpanId, TraceId};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
@@ -30,6 +31,7 @@ pub struct ProxyCaptureBackend {
     ca_dir: Option<PathBuf>,
     fault_config: FaultConfig,
     max_body_size: usize,
+    redaction: RedactionConfig,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -42,6 +44,7 @@ impl ProxyCaptureBackend {
             ca_dir: None,
             fault_config: FaultConfig::default(),
             max_body_size: MAX_BODY_SIZE,
+            redaction: RedactionConfig::default(),
             shutdown_tx: None,
             task_handle: None,
         }
@@ -67,6 +70,13 @@ impl ProxyCaptureBackend {
         self.max_body_size = max_body_size;
         self
     }
+
+    /// Redact configured header values and JSON body fields before a trace
+    /// is emitted (builder pattern). Empty by default (no redaction).
+    pub fn with_redaction(mut self, redaction: RedactionConfig) -> Self {
+        self.redaction = redaction;
+        self
+    }
 }
 
 impl CaptureBackend for ProxyCaptureBackend {
@@ -79,6 +89,7 @@ impl CaptureBackend for ProxyCaptureBackend {
             pending: None,
             fault_config: Arc::new(self.fault_config.clone()),
             max_body_size: self.max_body_size,
+            redaction: Arc::new(self.redaction.clone()),
         };
 
         let port = self.listen_port;
@@ -281,6 +292,7 @@ struct TraceHandler {
     pending: Option<PendingRequest>,
     fault_config: Arc<FaultConfig>,
     max_body_size: usize,
+    redaction: Arc<RedactionConfig>,
 }
 
 #[derive(Clone)]
@@ -364,7 +376,7 @@ impl HttpHandler for TraceHandler {
                         // Emit a trace immediately — handle_response won't be called.
                         if let Some(info) = self.pending.take() {
                             let fault_body = b"{\"fault\":\"injected\"}".to_vec();
-                            let trace = HttpTrace {
+                            let mut trace = HttpTrace {
                                 span_id: info.span_id,
                                 trace_id: info.trace_id,
                                 parent_span_id: None,
@@ -395,6 +407,7 @@ impl HttpHandler for TraceHandler {
                                 dest_addr: None,
                                 protocol_version: info.protocol_version,
                             };
+                            redact::redact_trace(&mut trace, &self.redaction);
                             if self.trace_tx.try_send(trace).is_err() {
                                 warn!("Trace channel full, dropping fault-injected trace");
                             }
@@ -433,7 +446,7 @@ impl HttpHandler for TraceHandler {
 
         if let Some(info) = self.pending.take() {
             let duration = info.started_at.elapsed();
-            let trace = HttpTrace {
+            let mut trace = HttpTrace {
                 span_id: info.span_id,
                 trace_id: info.trace_id,
                 parent_span_id: None,
@@ -456,6 +469,7 @@ impl HttpHandler for TraceHandler {
                 dest_addr: None,
                 protocol_version: info.protocol_version,
             };
+            redact::redact_trace(&mut trace, &self.redaction);
 
             if self.trace_tx.try_send(trace).is_err() {
                 warn!("Trace channel full, dropping trace");

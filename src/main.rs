@@ -6,6 +6,7 @@ use std::time::UNIX_EPOCH;
 use clap::{Parser, Subcommand, ValueEnum};
 use phantom_capture::{CaPaths, FaultConfig, ProxyCaptureBackend};
 use phantom_core::capture::CaptureBackend;
+use phantom_core::redact::RedactionConfig;
 use phantom_core::storage::TraceStore;
 use phantom_core::trace::HttpTrace;
 use phantom_storage::FjallTraceStore;
@@ -233,6 +234,27 @@ struct RunArgs {
     /// with request_body_truncated / response_body_truncated in output).
     #[arg(long, default_value = "1mb", value_parser = parse_body_size, value_name = "SIZE")]
     max_body: usize,
+
+    /// Redact common sensitive headers and JSON body fields (see
+    /// docs/jsonl-schema.md). Off by default so local debugging still shows
+    /// real values; turn this on before sharing or committing captured traces.
+    ///
+    /// Default headers: authorization, proxy-authorization, cookie,
+    /// set-cookie, x-api-key.
+    /// Default JSON body fields: password, token, access_token,
+    /// refresh_token, client_secret, api_key.
+    #[arg(long, default_value = "false")]
+    redact: bool,
+
+    /// Additionally redact this header (repeatable). Implies --redact is not
+    /// required — using this flag alone redacts only the headers you name.
+    #[arg(long, value_name = "NAME")]
+    redact_header: Vec<String>,
+
+    /// Additionally redact this JSON body field, matched recursively at any
+    /// nesting depth (repeatable). Non-JSON bodies are never touched.
+    #[arg(long, value_name = "KEY")]
+    redact_body_field: Vec<String>,
 
     /// Inject faults into proxied requests (proxy backend only).
     ///
@@ -563,6 +585,20 @@ fn build_fault_config(specs: &[String]) -> anyhow::Result<FaultConfig> {
     Ok(FaultConfig { rules })
 }
 
+/// Build the redaction config from `--redact` / `--redact-header` /
+/// `--redact-body-field`. `--redact` seeds the default lists;
+/// `--redact-header`/`--redact-body-field` add to whatever `--redact`
+/// already selected (so they compose rather than override).
+fn build_redaction_config(args: &RunArgs) -> RedactionConfig {
+    let mut headers = args.redact_header.clone();
+    let mut body_fields = args.redact_body_field.clone();
+    if args.redact {
+        headers.extend(RedactionConfig::default_header_names());
+        body_fields.extend(RedactionConfig::default_body_field_names());
+    }
+    RedactionConfig::new(headers, body_fields)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Proxy backend
 // ─────────────────────────────────────────────────────────────────────────────
@@ -804,6 +840,7 @@ fn spawn_proxy_child(
 
 async fn run_proxy(args: RunArgs, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
     let fault_config = build_fault_config(&args.fault)?;
+    let redaction = build_redaction_config(&args);
 
     // Persist the MITM CA under <data-dir>/ca so it survives restarts and can
     // be trusted by clients (see `phantom cert --help`).
@@ -815,7 +852,8 @@ async fn run_proxy(args: RunArgs, store: Arc<FjallTraceStore>) -> anyhow::Result
     let mut backend = ProxyCaptureBackend::new(args.port, args.insecure)
         .with_faults(fault_config)
         .with_ca_dir(ca_dir)
-        .with_max_body_size(args.max_body);
+        .with_max_body_size(args.max_body)
+        .with_redaction(redaction);
     let backend_name = backend.name().to_string();
     let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -921,7 +959,8 @@ async fn run_ldpreload(args: RunArgs, store: Arc<FjallTraceStore>) -> anyhow::Re
             .unwrap_or(0)
     ));
 
-    let mut backend = LdPreloadCaptureBackend::new(socket_path.clone());
+    let mut backend = LdPreloadCaptureBackend::new(socket_path.clone())
+        .with_redaction(build_redaction_config(&args));
     let backend_name = backend.name().to_string();
     let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 

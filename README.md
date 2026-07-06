@@ -32,6 +32,8 @@ phantom --fault delay:500ms:/api -- node app.js
 | **Interactive TUI** | Ratatui-based two-pane viewer with filtering. |
 | **JSONL output** | One JSON object per line on stdout; exits when the child exits. Built for `jq` pipelines and AI agents. |
 | **Fault injection** | `--fault delay:100ms-500ms`, `--fault error:503:0.5:/api` — verify timeout and error handling during development. |
+| **Content-Encoding decoding** | gzip/brotli/zstd/deflate response and request bodies are transparently decoded for storage/display; the wire is never altered. |
+| **Redaction** | `--redact` masks common secrets (`authorization`, `cookie`, `password`, `token`, …) in headers and JSON bodies before they ever hit disk. Off by default; opt in before sharing traces. |
 | **Local persistence** | Traces stored in an embedded [Fjall](https://github.com/fjall-rs/fjall) LSM-tree store. |
 | **LD_PRELOAD backend** (Linux) | Socket-level capture for proxy-unaware tools (plain HTTP). |
 

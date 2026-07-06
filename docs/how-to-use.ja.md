@@ -185,17 +185,30 @@ USAGE:
     phantom cert <path|print|export>      # HTTPS 傍受用 CA の管理
 
 OPTIONS (run):
-    -b, --backend <BACKEND>  [proxy, ldpreload] (デフォルト: proxy)
-    -o, --output <MODE>      [tui, jsonl] (デフォルト: tui)
-    -p, --port <PORT>        プロキシポート (デフォルト: 8080)
-    --insecure               バックエンド接続時の TLS 検証を無効化
-    -d, --data-dir <DIR>     データ保存先
-    --fault <SPEC>           フォールト注入 (繰り返し指定可)
-    --agent-lib <PATH>       libphantom_agent.so のパス (ldpreload 用)
-    -- <COMMAND>             実行・追跡するコマンド
+    -b, --backend <BACKEND>       [proxy, ldpreload] (デフォルト: proxy)
+    -o, --output <MODE>           [tui, jsonl] (デフォルト: tui)
+    -p, --port <PORT>             プロキシポート (デフォルト: 8080)
+    --insecure                    バックエンド接続時の TLS 検証を無効化
+    -d, --data-dir <DIR>          データ保存先
+    --max-body <SIZE>             ボディ保存の上限 ("512kb"/"1mb"/"2gb"、"0"で無制限。デフォルト "1mb")
+    --redact                      既定の機微ヘッダ・JSON フィールドを [REDACTED] に置換
+    --redact-header <NAME>        追加でリダクションするヘッダ名 (繰り返し指定可)
+    --redact-body-field <KEY>     追加でリダクションする JSON ボディのキー名 (繰り返し指定可)
+    --fault <SPEC>                フォールト注入 (繰り返し指定可)
+    --agent-lib <PATH>            libphantom_agent.so のパス (ldpreload 用)
+    -- <COMMAND>                  実行・追跡するコマンド
 ```
 
 サブコマンドを省略した従来形式 (`phantom -- node app.js`) は `phantom run` と完全に同じ動作です。
+
+### 機微情報のリダクション
+
+`--redact` を付けると、既定の機微ヘッダ(`authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`)と JSON ボディの既定フィールド(`password`, `token`, `access_token`, `refresh_token`, `client_secret`, `api_key`)が `[REDACTED]` に置換されます。デフォルトは **off**(ローカルデバッグでは生値を確認したいため)。**トレースを共有・コミットする場合は必ず `--redact` を使ってください。**
+
+```bash
+phantom --redact -- node app.js
+phantom --redact-header x-internal-token -- node app.js   # 個別追加のみも可能
+```
 
 ---
 
