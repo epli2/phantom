@@ -152,15 +152,17 @@ phantom --backend ldpreload \
 
 ### JSONL モード
 
-1 トレースを 1 行の JSON として出力します。
+1 トレースを 1 行の JSON として出力します。詳細なフィールド一覧・互換性ポリシーは
+[`docs/jsonl-schema.md`](jsonl-schema.md) を参照してください（`schema_version` は
+加算のみで進化し、既存フィールドの削除・改名・型変更は行いません）。
 
-**スキーマ要約:**
+**スキーマ要約 (schema_version 2):**
 - `trace_id` / `span_id`: W3C 互換 ID
 - `timestamp_ms`: 開始時刻 (Unix Epoch)
 - `duration_ms`: レイテンシ
 - `method` / `url` / `status_code`: 基本情報
 - `request_headers` / `response_headers`: ヘッダーマップ
-- `request_body` / `response_body`: UTF-8 デコード済みボディ (optional)
+- `request_body` / `response_body`: ボディ (`*_body_encoding` が `utf-8`/`base64` を示す。`*_body_truncated`、`*_content_encoding` も参照)
 
 ---
 
@@ -168,11 +170,31 @@ phantom --backend ldpreload \
 
 | キー | 動作 |
 |------|------|
-| `j` / `k` | 上下移動 |
+| `j` / `k` / `↓` / `↑` | 上下移動（詳細ペインではスクロール） |
+| `g` / `Home`, `G` / `End` | 先頭 / 末尾へジャンプ |
 | `Tab` | トレースリスト ↔ 詳細ペイン切り替え |
-| `/` | フィルタモード（URL 部分一致） |
+| `[` / `]` | 詳細ペインのタブ切り替え（Request / Response / Headers / Timing） |
+| `/` | フィルタモード開始 |
 | `Esc` | フィルタ解除 / 戻る |
+| `c` | 選択中のトレースを `curl` コマンドとしてクリップボードにコピー |
+| `w` | 選択中のトレースを `phantom-trace-<span_id>.json` に書き出し |
+| `?` | ヘルプオーバーレイの表示/非表示 |
 | `q` / `Ctrl+C` | 終了 |
+
+### フィルタ構文 (`/`)
+
+スペース区切りの単語は AND 条件になります。プレフィックスなしの単語は URL 部分一致です。
+
+| 構文 | 意味 | 例 |
+|------|------|-----|
+| `status:<code>` | ステータスコード完全一致 | `status:404` |
+| `status:<N>xx` | ステータスクラス一致 | `status:5xx` |
+| `status:>=N` / `<=N` / `>N` / `<N` | ステータスコード比較 | `status:>=500` |
+| `method:<name>` | HTTP メソッド一致（大小文字区別なし） | `method:post` |
+| `host:<substr>` | URL ホスト部分一致 | `host:api.example.com` |
+| `path:<substr>` | URL パス部分一致 | `path:/users` |
+
+例: `status:5xx method:post` は「POST かつ 5xx」のトレースのみ表示します。
 
 ---
 
