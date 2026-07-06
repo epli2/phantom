@@ -18,6 +18,10 @@ use serde::Serialize;
 /// Written to a temp file when tracing Node.js processes via `phantom -- node …`.
 const NODE_PROXY_PRELOAD: &str = include_str!("../tests/apps/node-app/proxy-preload.js");
 
+/// The Java Agent JAR, embedded at compile time.
+/// Written to a temp file when tracing Java processes via `phantom -- java …`.
+const JAVA_AGENT_JAR: &[u8] = include_bytes!("../crates/phantom-java-agent/phantom-java-agent.jar");
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
 // ─────────────────────────────────────────────────────────────────────────────
@@ -402,12 +406,23 @@ fn is_node_command(exe: &str) -> bool {
     base == "node" || base == "nodejs"
 }
 
+/// Returns `true` if `exe` (path or bare name) resolves to `java` or `javaw`.
+fn is_java_command(exe: &str) -> bool {
+    let base = Path::new(exe)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(exe);
+    base == "java" || base == "javaw"
+}
+
 /// Spawns `command` as a child process routed through the phantom proxy.
 ///
 /// * `HTTP_PROXY` / `http_proxy` are set so plain HTTP is captured.
 /// * For Node.js executables the embedded proxy-preload script is written to a
 ///   temp file and prepended as `--require <path>` so HTTPS is also captured
 ///   without touching the application source.
+/// * For Java executables, the phantom-java-agent.jar is injected via -javaagent
+///   to force proxy settings and bypass SSL verification globally.
 ///
 /// Returns `(child, Option<TempScript>)`.  The `TempScript` must be kept alive
 /// until after the child exits so the file is not deleted prematurely.
@@ -418,13 +433,16 @@ fn spawn_proxy_child(
     let exe = &command[0];
     let proxy_url = format!("http://127.0.0.1:{proxy_port}");
 
-    let (actual_args, temp_script): (Vec<String>, Option<TempScript>) = if is_node_command(exe) {
+    let mut temp_script: Option<TempScript> = None;
+    let mut actual_args = command[1..].to_vec();
+
+    if is_node_command(exe) {
         // Write the embedded preload script to a temp file.
         let script_path =
             std::env::temp_dir().join(format!("phantom-preload-{}.js", std::process::id()));
         std::fs::write(&script_path, NODE_PROXY_PRELOAD)
             .map_err(|e| anyhow::anyhow!("failed to write proxy preload script: {e}"))?;
-        let ts = TempScript(script_path.clone());
+        temp_script = Some(TempScript(script_path.clone()));
 
         // Prepend --require <script> before the rest of the args.
         let mut args = vec![
@@ -432,15 +450,36 @@ fn spawn_proxy_child(
             script_path.to_string_lossy().into_owned(),
         ];
         args.extend_from_slice(&command[1..]);
-        (args, Some(ts))
-    } else {
-        (command[1..].to_vec(), None)
-    };
+        actual_args = args;
+    }
 
-    let child = std::process::Command::new(exe)
-        .args(&actual_args)
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&actual_args)
         .env("HTTP_PROXY", &proxy_url)
-        .env("http_proxy", &proxy_url)
+        .env("http_proxy", &proxy_url);
+
+    // For Java processes, inject proxy settings and the Java Agent via JAVA_TOOL_OPTIONS.
+    if is_java_command(exe) {
+        // Write the embedded Java Agent to a temp file.
+        let agent_path =
+            std::env::temp_dir().join(format!("phantom-agent-{}.jar", std::process::id()));
+        std::fs::write(&agent_path, JAVA_AGENT_JAR)
+            .map_err(|e| anyhow::anyhow!("failed to write java agent jar: {e}"))?;
+        temp_script = Some(TempScript(agent_path.clone()));
+
+        let jvm_opts = format!(
+            " -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={proxy_port} \
+              -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={proxy_port} \
+              -Dhttp.nonProxyHosts= -Dhttps.nonProxyHosts= \
+              -javaagent:{}",
+            agent_path.display()
+        );
+
+        let existing = std::env::var("JAVA_TOOL_OPTIONS").unwrap_or_default();
+        cmd.env("JAVA_TOOL_OPTIONS", format!("{existing}{jvm_opts}"));
+    }
+
+    let child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {:?}: {e}", exe))?;
 

@@ -309,11 +309,9 @@ fn process_h2_send_frames(h2: &mut H2ConnState) {
         h2.send_buf.drain(..H2_PREFACE.len());
     }
 
-    loop {
-        let Some((payload_len, frame_type, flags, stream_id)) = parse_h2_frame_header(&h2.send_buf)
-        else {
-            break;
-        };
+    while let Some((payload_len, frame_type, flags, stream_id)) =
+        parse_h2_frame_header(&h2.send_buf)
+    {
         let total = H2_FRAME_HDR_LEN + payload_len;
         if h2.send_buf.len() < total {
             break; // Frame not yet fully buffered.
@@ -364,22 +362,20 @@ fn process_h2_send_frames(h2: &mut H2ConnState) {
                     stream.req_done |= end_stream;
                 }
             }
-            H2_TYPE_CONTINUATION if stream_id > 0 => {
-                if h2.send_cont_sid == Some(stream_id) {
-                    h2.send_cont_buf.extend_from_slice(&payload);
-                    if flags & H2_FLAG_END_HEADERS != 0 {
-                        let hblock = std::mem::take(&mut h2.send_cont_buf);
-                        let decoded = h2.send_hpack.decode(&hblock).unwrap_or_default();
-                        let end_stream = h2.send_cont_end_stream;
-                        let stream = h2
-                            .streams
-                            .entry(stream_id)
-                            .or_insert_with(|| H2Stream::new(tls));
-                        apply_h2_request_headers(stream, decoded);
-                        stream.req_done |= end_stream;
-                        h2.send_cont_sid = None;
-                        h2.send_cont_end_stream = false;
-                    }
+            H2_TYPE_CONTINUATION if stream_id > 0 && h2.send_cont_sid == Some(stream_id) => {
+                h2.send_cont_buf.extend_from_slice(&payload);
+                if flags & H2_FLAG_END_HEADERS != 0 {
+                    let hblock = std::mem::take(&mut h2.send_cont_buf);
+                    let decoded = h2.send_hpack.decode(&hblock).unwrap_or_default();
+                    let end_stream = h2.send_cont_end_stream;
+                    let stream = h2
+                        .streams
+                        .entry(stream_id)
+                        .or_insert_with(|| H2Stream::new(tls));
+                    apply_h2_request_headers(stream, decoded);
+                    stream.req_done |= end_stream;
+                    h2.send_cont_sid = None;
+                    h2.send_cont_end_stream = false;
                 }
             }
             _ => {} // SETTINGS, WINDOW_UPDATE, PING, GOAWAY, etc. — ignore.
@@ -389,11 +385,9 @@ fn process_h2_send_frames(h2: &mut H2ConnState) {
 
 /// Process all complete HTTP/2 frames in `h2.recv_buf` (incoming / response side).
 fn process_h2_recv_frames(h2: &mut H2ConnState) {
-    loop {
-        let Some((payload_len, frame_type, flags, stream_id)) = parse_h2_frame_header(&h2.recv_buf)
-        else {
-            break;
-        };
+    while let Some((payload_len, frame_type, flags, stream_id)) =
+        parse_h2_frame_header(&h2.recv_buf)
+    {
         let total = H2_FRAME_HDR_LEN + payload_len;
         if h2.recv_buf.len() < total {
             break;
@@ -441,22 +435,20 @@ fn process_h2_recv_frames(h2: &mut H2ConnState) {
                     stream.resp_done |= end_stream;
                 }
             }
-            H2_TYPE_CONTINUATION if stream_id > 0 => {
-                if h2.recv_cont_sid == Some(stream_id) {
-                    h2.recv_cont_buf.extend_from_slice(&payload);
-                    if flags & H2_FLAG_END_HEADERS != 0 {
-                        let hblock = std::mem::take(&mut h2.recv_cont_buf);
-                        let decoded = h2.recv_hpack.decode(&hblock).unwrap_or_default();
-                        let end_stream = h2.recv_cont_end_stream;
-                        let stream = h2
-                            .streams
-                            .entry(stream_id)
-                            .or_insert_with(|| H2Stream::new(tls));
-                        apply_h2_response_headers(stream, decoded);
-                        stream.resp_done |= end_stream;
-                        h2.recv_cont_sid = None;
-                        h2.recv_cont_end_stream = false;
-                    }
+            H2_TYPE_CONTINUATION if stream_id > 0 && h2.recv_cont_sid == Some(stream_id) => {
+                h2.recv_cont_buf.extend_from_slice(&payload);
+                if flags & H2_FLAG_END_HEADERS != 0 {
+                    let hblock = std::mem::take(&mut h2.recv_cont_buf);
+                    let decoded = h2.recv_hpack.decode(&hblock).unwrap_or_default();
+                    let end_stream = h2.recv_cont_end_stream;
+                    let stream = h2
+                        .streams
+                        .entry(stream_id)
+                        .or_insert_with(|| H2Stream::new(tls));
+                    apply_h2_response_headers(stream, decoded);
+                    stream.resp_done |= end_stream;
+                    h2.recv_cont_sid = None;
+                    h2.recv_cont_end_stream = false;
                 }
             }
             _ => {}
