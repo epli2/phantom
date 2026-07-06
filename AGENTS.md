@@ -184,6 +184,13 @@ cargo test --test proxy_node_integration test_proxy_captures_alternative_http_cl
 | `test_proxy_captures_node_app_traffic` | HTTP + HTTPS GET/POST via `http`/`https` modules (4 traces) |
 | `test_proxy_captures_alternative_http_clients` | axios, undici, fetch — HTTP + HTTPS × 3 clients (6 traces) |
 
+Both tests:
+- Auto-skip if `node` or `npm` is not in `PATH`.
+- Start in-process Rust mock backends (HTTP + HTTPS with self-signed cert).
+- Run `phantom --output jsonl --insecure -- node <script>.js`.
+- Parse JSONL output and assert method, path, status code per trace.
+- Identify traces by `x-phantom-client` custom header in `request_headers`.
+
 ### curl / CA Integration Tests (`tests/proxy_curl_https_integration.rs`)
 
 | Test | Description |
@@ -193,12 +200,16 @@ cargo test --test proxy_node_integration test_proxy_captures_alternative_http_cl
 
 Auto-skips when `curl` is not on PATH.
 
-Both tests:
-- Auto-skip if `node` or `npm` is not in `PATH`.
-- Start in-process Rust mock backends (HTTP + HTTPS with self-signed cert).
-- Run `phantom --output jsonl --insecure -- node <script>.js`.
-- Parse JSONL output and assert method, path, status code per trace.
-- Identify traces by `x-phantom-client` custom header in `request_headers`.
+### Other Runtime Compatibility Tests
+
+| File | Test | Description |
+|------|------|-------------|
+| `tests/proxy_gzip_integration.rs` | `test_gzip_response_is_decoded_for_storage_but_wire_is_unmodified` | Content-Encoding decode: recorded body is plaintext, wire bytes untouched |
+| `tests/proxy_python_integration.rs` | `test_proxy_captures_python_stdlib_client` | Python 3 `urllib.request` (stdlib only) — HTTP + HTTPS, auto-skips if `python3` missing |
+| `tests/proxy_go_integration.rs` | `test_proxy_captures_go_net_http_client` | Go `net/http` — HTTP only (see `docs/compatibility.md` for why HTTPS/loopback are excluded); auto-skips if `go` missing |
+| `tests/redaction_integration.rs` | `test_redact_masks_header_and_body_field`, `test_without_redact_flag_values_are_untouched` | `--redact` end-to-end through the real proxy |
+
+Full runtime support matrix and known limitations: [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Run a Single Unit Test Function
 

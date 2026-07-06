@@ -58,6 +58,8 @@ Pre-built binaries and Homebrew are planned — see the [roadmap](ROADMAP.md).
 
 Captured traces flow into the TUI or JSONL stream and are persisted locally. Everything binds to `127.0.0.1` only; nothing leaves your machine.
 
+Beyond Node.js, phantom's proxy backend also transparently captures curl, Python, Go, and Java clients — see [docs/compatibility.md](docs/compatibility.md) for exactly what's verified and two known limitations (Go's loopback-proxy quirk, IP-literal HTTPS targets).
+
 ### Trusting the CA outside phantom
 
 Processes spawned by phantom trust the CA automatically. For anything else (e.g. a browser):
