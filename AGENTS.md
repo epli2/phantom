@@ -15,9 +15,11 @@ crates/
   phantom-tui/               # Ratatui terminal UI
   phantom-agent/             # LD_PRELOAD dylib (Linux only, hooks libc send/recv)
 tests/
-  proxy_node_integration.rs  # Integration tests: Node.js proxy capture (HTTP + HTTPS)
-  apps/node-app/             # Test Node.js app (client.js, client-alts.js, proxy-preload.js)
-  integration/               # Shell-based integration tests
+  proxy_node_integration.rs       # Integration tests: Node.js proxy capture (HTTP + HTTPS)
+  proxy_curl_https_integration.rs # Integration tests: curl HTTPS via auto-set CA trust env
+  fault_injection.rs              # Integration tests: --fault delay/error rules
+  apps/node-app/                  # Test Node.js app (client.js, client-alts.js, proxy-preload.js)
+  integration/                    # Shell-based integration tests
 Cargo.toml                   # Workspace root + binary crate
 plan.md                      # Japanese-language technical design document
 ```
@@ -62,7 +64,18 @@ make test     # cargo test --workspace --all-targets --all-features
 make check    # fmt + clippy + build + test (full CI locally)
 ```
 
-### CLI Options
+### CLI Structure
+
+The CLI uses clap subcommands with a backward-compatible default:
+
+- `phantom [RUN-OPTIONS] [-- CMD]` — same as `phantom run …` (legacy form, kept working forever)
+- `phantom run [RUN-OPTIONS] [-- CMD]` — capture traffic
+- `phantom cert path|print|export [--out FILE]` — manage the persistent MITM CA
+
+`Cli` holds `Option<Command>` plus a flattened `RunArgs`; `args_conflicts_with_subcommands = true`.
+When adding a new subcommand, extend `enum Command` in `src/main.rs` and dispatch in `main()`.
+
+### Run Options
 
 | Flag | Default | Description |
 |---|---|---|
@@ -70,9 +83,25 @@ make check    # fmt + clippy + build + test (full CI locally)
 | `-o, --output <OUTPUT>` | `tui` | `tui` (interactive) or `jsonl` (stdout stream, auto-exits with child) |
 | `-p, --port <PORT>` | `8080` | Proxy capture port |
 | `--insecure` | off | Disable TLS verification for backend servers (self-signed certs) |
-| `-d, --data-dir <DIR>` | `~/.local/share/phantom/data` | Storage directory |
+| `-d, --data-dir <DIR>` | `~/.local/share/phantom/data` | Storage directory (CA lives in `<DIR>/ca`) |
+| `--fault <SPEC>` | — | Fault injection rules (repeatable) |
 | `--agent-lib <PATH>` | — | Path to `libphantom_agent.so` (ldpreload backend) |
 | `-- <CMD>` | — | Command to spawn and trace automatically |
+
+### CA Persistence and Trust Environment
+
+The MITM CA is persisted at `<data-dir>/ca/phantom-ca.{key,cert}.pem` (key is 0600; a
+`.gitignore` is written into `ca/`). `phantom_capture::ensure_ca(&ca_dir)` creates or loads it;
+`ProxyCaptureBackend::with_ca_dir(dir)` makes the proxy use it (without it the CA is ephemeral).
+
+`spawn_proxy_child` in `src/main.rs` configures the child environment:
+
+| Variable | Value | Note |
+|---|---|---|
+| `HTTP_PROXY` / `http_proxy` | proxy URL | always set (overrides inherited, with notice) |
+| `HTTPS_PROXY` / `https_proxy` | proxy URL | **non-Node only** — Node's preload tunnels HTTPS itself; setting it would trigger axios's own env proxying (removed for Node) |
+| `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `DENO_CERT` | combined bundle | `<ca-dir>/phantom-ca-bundle.pem` = previously trusted roots (user/system bundle) + phantom CA; always set |
+| `NO_PROXY`, `no_proxy`, `ALL_PROXY`, `all_proxy`, `npm_config_*proxy*` | *removed* | inherited values create capture blind spots or leak traffic to other proxies |
 
 ---
 
@@ -162,6 +191,15 @@ cargo test --test proxy_node_integration test_proxy_captures_alternative_http_cl
 |------|-------------|
 | `test_proxy_captures_node_app_traffic` | HTTP + HTTPS GET/POST via `http`/`https` modules (4 traces) |
 | `test_proxy_captures_alternative_http_clients` | axios, undici, fetch — HTTP + HTTPS × 3 clients (6 traces) |
+
+### curl / CA Integration Tests (`tests/proxy_curl_https_integration.rs`)
+
+| Test | Description |
+|------|-------------|
+| `test_curl_https_verifies_phantom_ca_without_insecure_flag` | Proxied curl verifies the MITM'd cert via auto-set `CURL_CA_BUNDLE` — no `curl -k` |
+| `test_ca_certificate_is_stable_across_runs` | `phantom cert path`/`print`; CA path and bytes identical across invocations |
+
+Auto-skips when `curl` is not on PATH.
 
 Both tests:
 - Auto-skip if `node` or `npm` is not in `PATH`.
