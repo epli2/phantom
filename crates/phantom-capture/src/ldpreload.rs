@@ -12,6 +12,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use phantom_core::capture::CaptureBackend;
 use phantom_core::error::CaptureError;
+use phantom_core::redact::{self, RedactionConfig};
 use phantom_core::trace::{HttpMethod, HttpTrace, SpanId, TraceId};
 use tokio::net::UnixDatagram;
 use tokio::sync::{mpsc, oneshot};
@@ -79,9 +80,15 @@ fn agent_trace_to_http_trace(a: AgentTrace) -> HttpTrace {
         url: a.url,
         request_headers: a.request_headers,
         request_body: decode_body(a.request_body_b64),
+        request_content_encoding: None,
+        request_body_truncated: false,
+        request_body_binary: false,
         status_code: a.status_code,
         response_headers: a.response_headers,
         response_body: decode_body(a.response_body_b64),
+        response_content_encoding: None,
+        response_body_truncated: false,
+        response_body_binary: false,
         timestamp,
         duration: Duration::from_millis(a.duration_ms),
         source_addr: None,
@@ -96,6 +103,7 @@ fn agent_trace_to_http_trace(a: AgentTrace) -> HttpTrace {
 
 pub struct LdPreloadCaptureBackend {
     socket_path: PathBuf,
+    redaction: RedactionConfig,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -108,6 +116,7 @@ impl LdPreloadCaptureBackend {
     pub fn new(socket_path: PathBuf) -> Self {
         Self {
             socket_path,
+            redaction: RedactionConfig::default(),
             shutdown_tx: None,
             task_handle: None,
         }
@@ -116,6 +125,13 @@ impl LdPreloadCaptureBackend {
     /// The Unix socket path agents must write to (`PHANTOM_SOCKET` env var).
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// Redact configured header values and JSON body fields before a trace
+    /// is emitted (builder pattern). Empty by default (no redaction).
+    pub fn with_redaction(mut self, redaction: RedactionConfig) -> Self {
+        self.redaction = redaction;
+        self
     }
 }
 
@@ -129,6 +145,7 @@ impl CaptureBackend for LdPreloadCaptureBackend {
 
         let (trace_tx, trace_rx) = mpsc::channel(4096);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let redaction = self.redaction.clone();
 
         let task_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -140,7 +157,8 @@ impl CaptureBackend for LdPreloadCaptureBackend {
                             Ok((n, _from)) => {
                                 match serde_json::from_slice::<AgentTrace>(&buf[..n]) {
                                     Ok(agent_trace) => {
-                                        let trace = agent_trace_to_http_trace(agent_trace);
+                                        let mut trace = agent_trace_to_http_trace(agent_trace);
+                                        redact::redact_trace(&mut trace, &redaction);
                                         debug!(url = %trace.url, "captured via ldpreload");
                                         if trace_tx.try_send(trace).is_err() {
                                             warn!("ldpreload trace channel full, dropping");

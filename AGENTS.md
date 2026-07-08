@@ -15,9 +15,11 @@ crates/
   phantom-tui/               # Ratatui terminal UI
   phantom-agent/             # LD_PRELOAD dylib (Linux only, hooks libc send/recv)
 tests/
-  proxy_node_integration.rs  # Integration tests: Node.js proxy capture (HTTP + HTTPS)
-  apps/node-app/             # Test Node.js app (client.js, client-alts.js, proxy-preload.js)
-  integration/               # Shell-based integration tests
+  proxy_node_integration.rs       # Integration tests: Node.js proxy capture (HTTP + HTTPS)
+  proxy_curl_https_integration.rs # Integration tests: curl HTTPS via auto-set CA trust env
+  fault_injection.rs              # Integration tests: --fault delay/error rules
+  apps/node-app/                  # Test Node.js app (client.js, client-alts.js, proxy-preload.js)
+  integration/                    # Shell-based integration tests
 Cargo.toml                   # Workspace root + binary crate
 plan.md                      # Japanese-language technical design document
 ```
@@ -62,7 +64,18 @@ make test     # cargo test --workspace --all-targets --all-features
 make check    # fmt + clippy + build + test (full CI locally)
 ```
 
-### CLI Options
+### CLI Structure
+
+The CLI uses clap subcommands with a backward-compatible default:
+
+- `phantom [RUN-OPTIONS] [-- CMD]` — same as `phantom run …` (legacy form, kept working forever)
+- `phantom run [RUN-OPTIONS] [-- CMD]` — capture traffic
+- `phantom cert path|print|export [--out FILE]` — manage the persistent MITM CA
+
+`Cli` holds `Option<Command>` plus a flattened `RunArgs`; `args_conflicts_with_subcommands = true`.
+When adding a new subcommand, extend `enum Command` in `src/main.rs` and dispatch in `main()`.
+
+### Run Options
 
 | Flag | Default | Description |
 |---|---|---|
@@ -70,9 +83,25 @@ make check    # fmt + clippy + build + test (full CI locally)
 | `-o, --output <OUTPUT>` | `tui` | `tui` (interactive) or `jsonl` (stdout stream, auto-exits with child) |
 | `-p, --port <PORT>` | `8080` | Proxy capture port |
 | `--insecure` | off | Disable TLS verification for backend servers (self-signed certs) |
-| `-d, --data-dir <DIR>` | `~/.local/share/phantom/data` | Storage directory |
+| `-d, --data-dir <DIR>` | `~/.local/share/phantom/data` | Storage directory (CA lives in `<DIR>/ca`) |
+| `--fault <SPEC>` | — | Fault injection rules (repeatable) |
 | `--agent-lib <PATH>` | — | Path to `libphantom_agent.so` (ldpreload backend) |
 | `-- <CMD>` | — | Command to spawn and trace automatically |
+
+### CA Persistence and Trust Environment
+
+The MITM CA is persisted at `<data-dir>/ca/phantom-ca.{key,cert}.pem` (key is 0600; a
+`.gitignore` is written into `ca/`). `phantom_capture::ensure_ca(&ca_dir)` creates or loads it;
+`ProxyCaptureBackend::with_ca_dir(dir)` makes the proxy use it (without it the CA is ephemeral).
+
+`spawn_proxy_child` in `src/main.rs` configures the child environment:
+
+| Variable | Value | Note |
+|---|---|---|
+| `HTTP_PROXY` / `http_proxy` | proxy URL | always set (overrides inherited, with notice) |
+| `HTTPS_PROXY` / `https_proxy` | proxy URL | **non-Node only** — Node's preload tunnels HTTPS itself; setting it would trigger axios's own env proxying (removed for Node) |
+| `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `DENO_CERT` | combined bundle | `<ca-dir>/phantom-ca-bundle.pem` = previously trusted roots (user/system bundle) + phantom CA; always set |
+| `NO_PROXY`, `no_proxy`, `ALL_PROXY`, `all_proxy`, `npm_config_*proxy*` | *removed* | inherited values create capture blind spots or leak traffic to other proxies |
 
 ---
 
@@ -106,24 +135,16 @@ When the command after `--` is `node` or `nodejs`, phantom automatically:
 
 ## JSONL Output Schema
 
-When `--output jsonl` is used, one JSON object is written per line to stdout. All fields are always present unless marked optional.
+When `--output jsonl` is used, one JSON object is written per line to stdout.
+**Full field reference and compatibility policy: [`docs/jsonl-schema.md`](docs/jsonl-schema.md)** — this
+is the single source of truth; keep it, not a copy of its table, up to date here.
 
-| Field | Type | Description |
-|---|---|---|
-| `trace_id` | string | W3C-compatible 128-bit trace ID (hex, 32 chars) |
-| `span_id` | string | 64-bit span ID (hex, 16 chars) |
-| `timestamp_ms` | number | Unix epoch milliseconds — request start time |
-| `duration_ms` | number | Round-trip latency in milliseconds |
-| `method` | string | HTTP verb: `"GET"`, `"POST"`, `"PUT"`, `"DELETE"`, … |
-| `url` | string | Full request URL (scheme + host + path + query) |
-| `status_code` | number | HTTP response status code |
-| `protocol_version` | string | HTTP version string, e.g. `"HTTP/1.1"` |
-| `request_headers` | object | Lower-cased header names → values |
-| `response_headers` | object | Lower-cased header names → values |
-| `request_body` | string? | UTF-8 decoded body; omitted when empty |
-| `response_body` | string? | UTF-8 decoded body; omitted when empty |
-| `source_addr` | string? | Client socket address, e.g. `"127.0.0.1:54321"` |
-| `dest_addr` | string? | Server socket address, e.g. `"93.184.216.34:443"` |
+Summary: `schema_version` (currently `2`) identifies the record shape; within
+a version, fields are only ever added, never removed/renamed/retyped. Bodies
+carry `*_body_encoding` (`"utf-8"`|`"base64"`), `*_body_truncated`, and
+`*_content_encoding` (set when a compressed body was transparently decoded
+for the record — the wire bytes forwarded to the real client/server are
+never altered).
 
 ---
 
@@ -169,6 +190,26 @@ Both tests:
 - Run `phantom --output jsonl --insecure -- node <script>.js`.
 - Parse JSONL output and assert method, path, status code per trace.
 - Identify traces by `x-phantom-client` custom header in `request_headers`.
+
+### curl / CA Integration Tests (`tests/proxy_curl_https_integration.rs`)
+
+| Test | Description |
+|------|-------------|
+| `test_curl_https_verifies_phantom_ca_without_insecure_flag` | Proxied curl verifies the MITM'd cert via auto-set `CURL_CA_BUNDLE` — no `curl -k` |
+| `test_ca_certificate_is_stable_across_runs` | `phantom cert path`/`print`; CA path and bytes identical across invocations |
+
+Auto-skips when `curl` is not on PATH.
+
+### Other Runtime Compatibility Tests
+
+| File | Test | Description |
+|------|------|-------------|
+| `tests/proxy_gzip_integration.rs` | `test_gzip_response_is_decoded_for_storage_but_wire_is_unmodified` | Content-Encoding decode: recorded body is plaintext, wire bytes untouched |
+| `tests/proxy_python_integration.rs` | `test_proxy_captures_python_stdlib_client` | Python 3 `urllib.request` (stdlib only) — HTTP + HTTPS, auto-skips if `python3` missing |
+| `tests/proxy_go_integration.rs` | `test_proxy_captures_go_net_http_client` | Go `net/http` — HTTP only (see `docs/compatibility.md` for why HTTPS/loopback are excluded); auto-skips if `go` missing |
+| `tests/redaction_integration.rs` | `test_redact_masks_header_and_body_field`, `test_without_redact_flag_values_are_untouched` | `--redact` end-to-end through the real proxy |
+
+Full runtime support matrix and known limitations: [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Run a Single Unit Test Function
 

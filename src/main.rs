@@ -1,10 +1,12 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use clap::{Parser, ValueEnum};
-use phantom_capture::{FaultConfig, ProxyCaptureBackend};
+use clap::{Parser, Subcommand, ValueEnum};
+use phantom_capture::{CaPaths, FaultConfig, ProxyCaptureBackend};
 use phantom_core::capture::CaptureBackend;
+use phantom_core::redact::RedactionConfig;
 use phantom_core::storage::TraceStore;
 use phantom_core::trace::HttpTrace;
 use phantom_storage::FjallTraceStore;
@@ -82,21 +84,18 @@ The target application requires NO code changes.\n\
   jsonl — One JSON object per line on stdout.  phantom exits automatically\n\
           when the child process exits (ideal for scripting and AI agents).\n\
 \n\
-  JSONL record schema (all fields always present unless marked optional):\n\
-    trace_id          string   W3C-compatible 128-bit trace ID (hex, 32 chars)\n\
-    span_id           string   64-bit span ID (hex, 16 chars)\n\
-    timestamp_ms      number   Unix epoch milliseconds — request start time\n\
-    duration_ms       number   Round-trip latency in milliseconds\n\
-    method            string   HTTP verb: \"GET\", \"POST\", \"PUT\", \"DELETE\", …\n\
-    url               string   Full request URL (scheme + host + path + query)\n\
-    status_code       number   HTTP response status code (200, 404, 500, …)\n\
-    protocol_version  string   HTTP version string, e.g. \"HTTP/1.1\"\n\
-    request_headers   object   Lower-cased header names → values\n\
-    response_headers  object   Lower-cased header names → values\n\
-    request_body      string?  UTF-8 decoded body; omitted when empty\n\
-    response_body     string?  UTF-8 decoded body; omitted when empty\n\
-    source_addr       string?  Client socket address, e.g. \"127.0.0.1:54321\"\n\
-    dest_addr         string?  Server socket address, e.g. \"93.184.216.34:443\"",
+  JSONL record (schema_version 2 — additive-only within a version):\n\
+    trace_id, span_id           W3C-compatible trace/span IDs (hex)\n\
+    timestamp_ms, duration_ms   Request start time and round-trip latency\n\
+    method, url, status_code, protocol_version\n\
+    request_headers, response_headers            Lower-cased header maps\n\
+    request_body, response_body                  Omitted when empty\n\
+    *_body_encoding              \"utf-8\" or \"base64\" (binary bodies)\n\
+    *_body_truncated              true if cut off at --max-body\n\
+    *_content_encoding            original Content-Encoding, if decoded\n\
+    source_addr, dest_addr        Socket addresses, if available\n\
+\n\
+  Full field reference: docs/jsonl-schema.md",
     after_long_help = "EXAMPLES\n\
 \n\
   ┌─ Proxy mode (default) ──────────────────────────────────────────────────┐\n\
@@ -144,9 +143,60 @@ The target application requires NO code changes.\n\
     | jq '{method,url,status_code,duration_ms}' # compact summary\n\
 \n\
   └─────────────────────────────────────────────────────────────────────────┘",
-    version
+    version,
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Capture traffic from a target process (default when no subcommand is given).
+    ///
+    /// `phantom run -- node app.js` and the legacy `phantom -- node app.js`
+    /// are equivalent; see `phantom --help` for the full capture guide.
+    Run(RunArgs),
+    /// Manage the CA certificate used for HTTPS interception.
+    ///
+    /// The CA is generated once and persisted under <DATA_DIR>/ca. Clients
+    /// spawned via `phantom -- CMD` trust it automatically through environment
+    /// variables (CURL_CA_BUNDLE, NODE_EXTRA_CA_CERTS, …); use this command to
+    /// trust it from apps that phantom does not spawn (e.g. browsers).
+    Cert(CertArgs),
+}
+
+#[derive(clap::Args)]
+struct CertArgs {
+    /// Directory where phantom stores data (the CA lives in <DIR>/ca).
+    /// Defaults to the platform data directory, e.g. ~/.local/share/phantom/data.
+    #[arg(short, long)]
+    data_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    action: CertAction,
+}
+
+#[derive(Subcommand)]
+enum CertAction {
+    /// Print the absolute path of the CA certificate (PEM).
+    Path,
+    /// Print the CA certificate PEM to stdout.
+    Print,
+    /// Copy the CA certificate to a file and show OS trust-store instructions.
+    Export {
+        /// Output file path.
+        #[arg(long, default_value = "phantom-ca.cert.pem")]
+        out: PathBuf,
+    },
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
     /// Capture backend: 'proxy' (MITM, cross-platform) or 'ldpreload' (Linux, plain HTTP only).
     #[arg(short, long, value_enum, default_value = "proxy")]
     backend: Backend,
@@ -177,6 +227,35 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     agent_lib: Option<PathBuf>,
 
+    /// Maximum size of request/response bodies to capture and store.
+    ///
+    /// Accepts a plain byte count or a suffix: "512kb", "1mb", "2gb".
+    /// Use "0" for unlimited. Bodies larger than this are truncated (marked
+    /// with request_body_truncated / response_body_truncated in output).
+    #[arg(long, default_value = "1mb", value_parser = parse_body_size, value_name = "SIZE")]
+    max_body: usize,
+
+    /// Redact common sensitive headers and JSON body fields (see
+    /// docs/jsonl-schema.md). Off by default so local debugging still shows
+    /// real values; turn this on before sharing or committing captured traces.
+    ///
+    /// Default headers: authorization, proxy-authorization, cookie,
+    /// set-cookie, x-api-key.
+    /// Default JSON body fields: password, token, access_token,
+    /// refresh_token, client_secret, api_key.
+    #[arg(long, default_value = "false")]
+    redact: bool,
+
+    /// Additionally redact this header (repeatable). Implies --redact is not
+    /// required — using this flag alone redacts only the headers you name.
+    #[arg(long, value_name = "NAME")]
+    redact_header: Vec<String>,
+
+    /// Additionally redact this JSON body field, matched recursively at any
+    /// nesting depth (repeatable). Non-JSON bodies are never touched.
+    #[arg(long, value_name = "KEY")]
+    redact_body_field: Vec<String>,
+
     /// Inject faults into proxied requests (proxy backend only).
     ///
     /// SPEC formats:
@@ -202,6 +281,31 @@ struct Cli {
     command: Vec<String>,
 }
 
+/// Parse a body-size flag value: a plain byte count, or a number with a
+/// "kb"/"mb"/"gb" suffix (case-insensitive). `"0"` means unlimited.
+fn parse_body_size(s: &str) -> Result<usize, String> {
+    let trimmed = s.trim();
+    if trimmed == "0" {
+        return Ok(0);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let (num_str, mult): (&str, usize) = if let Some(n) = lower.strip_suffix("kb") {
+        (n, 1024)
+    } else if let Some(n) = lower.strip_suffix("mb") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("gb") {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let n: usize = num_str.trim().parse().map_err(|_| {
+        format!("invalid size {s:?} (expected e.g. \"1mb\", \"512kb\", or \"0\" for unlimited)")
+    })?;
+    Ok(n * mult)
+}
+
 fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -217,6 +321,9 @@ fn default_data_dir() -> PathBuf {
 /// Emitted as one JSON object per line to stdout in `--output jsonl` mode.
 #[derive(Serialize)]
 struct JsonlTrace {
+    /// JSONL schema version. See docs/jsonl-schema.md for the field reference
+    /// and compatibility policy (same version: additive changes only).
+    schema_version: u32,
     /// Unix timestamp of the request in milliseconds.
     timestamp_ms: u64,
     /// Round-trip duration in milliseconds.
@@ -231,12 +338,30 @@ struct JsonlTrace {
     request_headers: std::collections::HashMap<String, String>,
     /// Response headers (lower-cased keys).
     response_headers: std::collections::HashMap<String, String>,
-    /// Request body decoded as UTF-8 (replacement chars for non-UTF-8 bytes).
+    /// Request body, UTF-8 text or base64 (see `request_body_encoding`).
     #[serde(skip_serializing_if = "Option::is_none")]
     request_body: Option<String>,
-    /// Response body decoded as UTF-8 (replacement chars for non-UTF-8 bytes).
+    /// Response body, UTF-8 text or base64 (see `response_body_encoding`).
     #[serde(skip_serializing_if = "Option::is_none")]
     response_body: Option<String>,
+    /// `"utf-8"` or `"base64"`. Present whenever `request_body` is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_body_encoding: Option<&'static str>,
+    /// `"utf-8"` or `"base64"`. Present whenever `response_body` is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_body_encoding: Option<&'static str>,
+    /// `true` if `request_body` was cut off at the `--max-body` limit.
+    request_body_truncated: bool,
+    /// `true` if `response_body` was cut off at the `--max-body` limit.
+    response_body_truncated: bool,
+    /// Original `Content-Encoding` of the request body, if it was decoded
+    /// for storage (e.g. `"gzip"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_content_encoding: Option<String>,
+    /// Original `Content-Encoding` of the response body, if it was decoded
+    /// for storage (e.g. `"gzip"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_content_encoding: Option<String>,
     /// Source socket address, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     source_addr: Option<String>,
@@ -251,9 +376,26 @@ struct JsonlTrace {
     span_id: String,
 }
 
-fn body_to_str(body: &Option<Vec<u8>>) -> Option<String> {
-    body.as_ref()
-        .map(|b| String::from_utf8_lossy(b).into_owned())
+/// Current JSONL schema version. Bump only for breaking changes; additive
+/// fields do not require a bump. See docs/jsonl-schema.md.
+const JSONL_SCHEMA_VERSION: u32 = 2;
+
+/// Render a body for JSONL: UTF-8 text as-is, binary as base64.
+fn body_to_jsonl(
+    body: &Option<Vec<u8>>,
+    is_binary: bool,
+) -> (Option<String>, Option<&'static str>) {
+    match body {
+        None => (None, None),
+        Some(b) if is_binary => (
+            Some(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b,
+            )),
+            Some("base64"),
+        ),
+        Some(b) => (Some(String::from_utf8_lossy(b).into_owned()), Some("utf-8")),
+    }
 }
 
 fn trace_to_jsonl(t: &HttpTrace) -> JsonlTrace {
@@ -263,7 +405,13 @@ fn trace_to_jsonl(t: &HttpTrace) -> JsonlTrace {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    let (request_body, request_body_encoding) =
+        body_to_jsonl(&t.request_body, t.request_body_binary);
+    let (response_body, response_body_encoding) =
+        body_to_jsonl(&t.response_body, t.response_body_binary);
+
     JsonlTrace {
+        schema_version: JSONL_SCHEMA_VERSION,
         timestamp_ms,
         duration_ms: t.duration.as_millis() as u64,
         method: t.method.to_string(),
@@ -271,8 +419,14 @@ fn trace_to_jsonl(t: &HttpTrace) -> JsonlTrace {
         status_code: t.status_code,
         request_headers: t.request_headers.clone(),
         response_headers: t.response_headers.clone(),
-        request_body: body_to_str(&t.request_body),
-        response_body: body_to_str(&t.response_body),
+        request_body,
+        response_body,
+        request_body_encoding,
+        response_body_encoding,
+        request_body_truncated: t.request_body_truncated,
+        response_body_truncated: t.response_body_truncated,
+        request_content_encoding: t.request_content_encoding.clone(),
+        response_content_encoding: t.response_content_encoding.clone(),
         source_addr: t.source_addr.clone(),
         dest_addr: t.dest_addr.clone(),
         protocol_version: t.protocol_version.clone(),
@@ -358,16 +512,63 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
+    // Subcommand-less invocation (`phantom -- node app.js`) behaves exactly
+    // like `phantom run -- node app.js` for backward compatibility.
+    let args = match cli.command {
+        Some(Command::Cert(cert)) => return run_cert(cert),
+        Some(Command::Run(run)) => run,
+        None => cli.run,
+    };
+
+    let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)?;
 
     let store = Arc::new(FjallTraceStore::open(&data_dir)?);
 
-    match cli.backend {
-        Backend::Proxy => run_proxy(cli, store).await,
+    match args.backend {
+        Backend::Proxy => run_proxy(args, store).await,
         #[cfg(target_os = "linux")]
-        Backend::Ldpreload => run_ldpreload(cli, store).await,
+        Backend::Ldpreload => run_ldpreload(args, store).await,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cert subcommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn run_cert(args: CertArgs) -> anyhow::Result<()> {
+    let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
+    let ca_dir = data_dir.join("ca");
+    let ca = phantom_capture::ensure_ca(&ca_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    match args.action {
+        CertAction::Path => println!("{}", ca.cert_path.display()),
+        CertAction::Print => print!("{}", std::fs::read_to_string(&ca.cert_path)?),
+        CertAction::Export { out } => {
+            std::fs::copy(&ca.cert_path, &out)
+                .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", out.display()))?;
+            eprintln!("phantom: CA certificate exported to {}", out.display());
+            eprintln!();
+            eprintln!("Processes spawned via `phantom -- CMD` trust this CA automatically.");
+            eprintln!("To trust it system-wide (for apps phantom does not spawn):");
+            eprintln!();
+            eprintln!("  macOS:");
+            eprintln!("    sudo security add-trusted-cert -d -r trustRoot \\");
+            eprintln!(
+                "      -k /Library/Keychains/System.keychain {}",
+                out.display()
+            );
+            eprintln!("  Ubuntu/Debian:");
+            eprintln!(
+                "    sudo cp {} /usr/local/share/ca-certificates/phantom-ca.crt",
+                out.display()
+            );
+            eprintln!("    sudo update-ca-certificates");
+            eprintln!("  Windows (PowerShell, admin):");
+            eprintln!("    certutil -addstore -f ROOT {}", out.display());
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -382,6 +583,20 @@ fn build_fault_config(specs: &[String]) -> anyhow::Result<FaultConfig> {
         rules.push(rule);
     }
     Ok(FaultConfig { rules })
+}
+
+/// Build the redaction config from `--redact` / `--redact-header` /
+/// `--redact-body-field`. `--redact` seeds the default lists;
+/// `--redact-header`/`--redact-body-field` add to whatever `--redact`
+/// already selected (so they compose rather than override).
+fn build_redaction_config(args: &RunArgs) -> RedactionConfig {
+    let mut headers = args.redact_header.clone();
+    let mut body_fields = args.redact_body_field.clone();
+    if args.redact {
+        headers.extend(RedactionConfig::default_header_names());
+        body_fields.extend(RedactionConfig::default_body_field_names());
+    }
+    RedactionConfig::new(headers, body_fields)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -415,9 +630,76 @@ fn is_java_command(exe: &str) -> bool {
     base == "java" || base == "javaw"
 }
 
+/// Locate the baseline CA roots to include in the combined phantom bundle:
+/// a bundle the user already points at via environment, else the system one.
+fn find_base_ca_bundle() -> Option<PathBuf> {
+    for key in ["CURL_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"] {
+        if let Some(p) = std::env::var_os(key) {
+            let p = PathBuf::from(p);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    [
+        "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",   // Fedora/RHEL
+        "/etc/ssl/ca-bundle.pem",             // openSUSE
+        "/etc/ssl/cert.pem",                  // macOS (LibreSSL), Alpine, BSD
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|p| p.is_file())
+}
+
+/// Write `<ca_dir>/phantom-ca-bundle.pem`: previously trusted roots (user or
+/// system bundle, plus any NODE_EXTRA_CA_CERTS) with the phantom CA appended.
+/// A strict superset of what the child already trusted, so pointing trust
+/// variables at it never *removes* trust — it only adds the phantom CA.
+/// Rebuilt on every start so trust-store updates are picked up.
+fn build_ca_bundle(ca_dir: &Path, ca: &CaPaths) -> anyhow::Result<PathBuf> {
+    let bundle_path = ca_dir.join("phantom-ca-bundle.pem");
+    let mut bundle = String::new();
+
+    let mut append_file = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(pem) => {
+            bundle.push_str(&pem);
+            if !bundle.ends_with('\n') {
+                bundle.push('\n');
+            }
+        }
+        Err(e) => eprintln!("phantom: could not read CA file {}: {e}", path.display()),
+    };
+
+    match find_base_ca_bundle() {
+        Some(base) => append_file(&base),
+        None => eprintln!(
+            "phantom: no system CA bundle found; the traced process will only \
+             trust the phantom CA"
+        ),
+    }
+
+    // Extra CAs the user already gave to Node.js stay trusted.
+    if let Some(extra) = std::env::var_os("NODE_EXTRA_CA_CERTS") {
+        let extra = PathBuf::from(extra);
+        if extra.is_file() {
+            append_file(&extra);
+        }
+    }
+
+    bundle.push_str(&std::fs::read_to_string(&ca.cert_path)?);
+    std::fs::write(&bundle_path, bundle)?;
+
+    Ok(bundle_path)
+}
+
 /// Spawns `command` as a child process routed through the phantom proxy.
 ///
-/// * `HTTP_PROXY` / `http_proxy` are set so plain HTTP is captured.
+/// * `HTTP_PROXY` / `HTTPS_PROXY` (and lowercase variants) are set so both
+///   plain and TLS traffic is captured.
+/// * CA trust variables (CURL_CA_BUNDLE, SSL_CERT_FILE, REQUESTS_CA_BUNDLE,
+///   NODE_EXTRA_CA_CERTS, DENO_CERT) point at the phantom CA so clients can
+///   verify MITM'd certificates without disabling TLS verification.
 /// * For Node.js executables the embedded proxy-preload script is written to a
 ///   temp file and prepended as `--require <path>` so HTTPS is also captured
 ///   without touching the application source.
@@ -429,6 +711,7 @@ fn is_java_command(exe: &str) -> bool {
 fn spawn_proxy_child(
     command: &[String],
     proxy_port: u16,
+    ca_bundle: &Path,
 ) -> anyhow::Result<(std::process::Child, Option<TempScript>)> {
     let exe = &command[0];
     let proxy_url = format!("http://127.0.0.1:{proxy_port}");
@@ -454,11 +737,38 @@ fn spawn_proxy_child(
     }
 
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(&actual_args)
-        .env("HTTP_PROXY", &proxy_url)
-        .env("http_proxy", &proxy_url);
+    cmd.args(&actual_args);
 
-    // For Java processes, inject proxy settings and the Java Agent via JAVA_TOOL_OPTIONS.
+    // Route both plain and TLS traffic through the proxy. These are essential
+    // for capture, so an existing value is overridden (with a notice).
+    //
+    // Node.js is the exception: proxy-preload.js routes HTTPS itself via a
+    // CONNECT tunnel agent. Setting HTTPS_PROXY there would also trigger
+    // axios's own env-based proxying of https:// URLs, which conflicts with
+    // the preload's patched https.request.
+    let proxy_keys: &[&str] = if is_node_command(exe) {
+        &["HTTP_PROXY", "http_proxy"]
+    } else {
+        &["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"]
+    };
+    for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+        if proxy_keys.contains(&key) {
+            if let Some(old) = std::env::var_os(key)
+                && old != *OsStr::new(&proxy_url)
+            {
+                eprintln!("phantom: overriding {key} for the traced process");
+            }
+            cmd.env(key, &proxy_url);
+        } else {
+            // Inherited values must not leak into the child either.
+            cmd.env_remove(key);
+        }
+    }
+
+    // For Java processes, additionally inject proxy settings and the Java
+    // Agent via JAVA_TOOL_OPTIONS. The JVM does not read HTTP_PROXY /
+    // HTTPS_PROXY itself, so this is required for java.net-based clients to
+    // route through phantom at all.
     if is_java_command(exe) {
         // Write the embedded Java Agent to a temp file.
         let agent_path =
@@ -479,6 +789,48 @@ fn spawn_proxy_child(
         cmd.env("JAVA_TOOL_OPTIONS", format!("{existing}{jvm_opts}"));
     }
 
+    // Other inherited proxy variables would make the child bypass phantom
+    // (NO_PROXY) or send traffic to a different proxy (ALL_PROXY, npm_config_*),
+    // silently creating capture blind spots — clear them.
+    for key in [
+        "NO_PROXY",
+        "no_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "npm_config_proxy",
+        "npm_config_http_proxy",
+        "npm_config_https_proxy",
+        "npm_config_no_proxy",
+        "npm_config_noproxy",
+    ] {
+        if std::env::var_os(key).is_some() {
+            eprintln!("phantom: clearing {key} for the traced process");
+        }
+        cmd.env_remove(key);
+    }
+
+    // Point common TLS stacks at the combined bundle (previously trusted
+    // roots + phantom CA) so MITM'd certificates verify without disabling
+    // TLS verification. The bundle is a superset of what was trusted before
+    // (build_ca_bundle folds in any user-set bundle), so overriding is safe.
+    // Java is unaffected by these (it uses the -javaagent trust-all bypass
+    // above instead of these env-based TLS trust stores).
+    for key in [
+        "SSL_CERT_FILE",       // OpenSSL, Ruby, some Go builds
+        "CURL_CA_BUNDLE",      // curl
+        "REQUESTS_CA_BUNDLE",  // Python requests
+        "NODE_EXTRA_CA_CERTS", // Node.js (additive)
+        "DENO_CERT",           // Deno
+    ] {
+        if std::env::var_os(key).is_some() {
+            eprintln!(
+                "phantom: {key} was set; pointing it at the combined phantom CA \
+                 bundle (previous roots included)"
+            );
+        }
+        cmd.env(key, ca_bundle.as_os_str());
+    }
+
     let child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {:?}: {e}", exe))?;
@@ -486,48 +838,62 @@ fn spawn_proxy_child(
     Ok((child, temp_script))
 }
 
-async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
-    let fault_config = build_fault_config(&cli.fault)?;
-    let mut backend = ProxyCaptureBackend::new(cli.port, cli.insecure).with_faults(fault_config);
+async fn run_proxy(args: RunArgs, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
+    let fault_config = build_fault_config(&args.fault)?;
+    let redaction = build_redaction_config(&args);
+
+    // Persist the MITM CA under <data-dir>/ca so it survives restarts and can
+    // be trusted by clients (see `phantom cert --help`).
+    let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
+    let ca_dir = data_dir.join("ca");
+    let ca_paths = phantom_capture::ensure_ca(&ca_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ca_bundle = build_ca_bundle(&ca_dir, &ca_paths)?;
+
+    let mut backend = ProxyCaptureBackend::new(args.port, args.insecure)
+        .with_faults(fault_config)
+        .with_ca_dir(ca_dir)
+        .with_max_body_size(args.max_body)
+        .with_redaction(redaction);
     let backend_name = backend.name().to_string();
     let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Optionally spawn a child command routed through the proxy.
     let child_and_script: Option<(std::process::Child, Option<TempScript>)> =
-        if !cli.command.is_empty() {
+        if !args.command.is_empty() {
             // Wait for the proxy to be ready before spawning the child.
-            wait_for_proxy(cli.port).await?;
-            let (child, ts) = spawn_proxy_child(&cli.command, cli.port)?;
+            wait_for_proxy(args.port).await?;
+            let (child, ts) = spawn_proxy_child(&args.command, args.port, &ca_bundle)?;
             eprintln!(
                 "phantom: spawned PID {} → {}",
                 child.id(),
-                cli.command.join(" ")
+                args.command.join(" ")
             );
             Some((child, ts))
         } else {
             None
         };
 
-    match cli.output {
+    match args.output {
         OutputMode::Tui => {
-            if cli.command.is_empty() {
-                eprintln!("phantom: proxy listening on 127.0.0.1:{}", cli.port);
-                eprintln!("  Set your HTTP proxy to http://127.0.0.1:{}", cli.port);
+            if args.command.is_empty() {
+                eprintln!("phantom: proxy listening on 127.0.0.1:{}", args.port);
+                eprintln!("  Set your HTTP proxy to http://127.0.0.1:{}", args.port);
                 eprintln!(
                     "  Example: curl -x http://127.0.0.1:{} http://httpbin.org/get",
-                    cli.port
+                    args.port
                 );
+                eprintln!("  HTTPS: trust the phantom CA — see `phantom cert export --help`");
             }
             eprintln!(
                 "phantom: traces stored in {}",
-                store_path_display(&cli.data_dir)
+                store_path_display(&args.data_dir)
             );
             phantom_tui::run_tui(store, trace_rx, &backend_name).await?;
         }
         OutputMode::Jsonl => {
             eprintln!(
                 "phantom: proxy listening on 127.0.0.1:{} [jsonl mode]",
-                cli.port
+                args.port
             );
             // Split into child and script guard separately so the TempScript
             // is NOT dropped until after run_jsonl_output completes (the file
@@ -567,17 +933,17 @@ async fn wait_for_proxy(port: u16) -> anyhow::Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
-async fn run_ldpreload(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
+async fn run_ldpreload(args: RunArgs, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
     use phantom_capture::LdPreloadCaptureBackend;
 
-    let agent_lib = cli.agent_lib.clone().ok_or_else(|| {
+    let agent_lib = args.agent_lib.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "--agent-lib <PATH> is required for --backend ldpreload\n\
             Example: --agent-lib ./target/debug/libphantom_agent.so"
         )
     })?;
 
-    if cli.command.is_empty() {
+    if args.command.is_empty() {
         anyhow::bail!(
             "A command to trace is required for --backend ldpreload.\n\
             Usage: phantom --backend ldpreload --agent-lib ./libphantom_agent.so -- curl http://example.com"
@@ -593,30 +959,31 @@ async fn run_ldpreload(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<
             .unwrap_or(0)
     ));
 
-    let mut backend = LdPreloadCaptureBackend::new(socket_path.clone());
+    let mut backend = LdPreloadCaptureBackend::new(socket_path.clone())
+        .with_redaction(build_redaction_config(&args));
     let backend_name = backend.name().to_string();
     let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     eprintln!("phantom: ldpreload backend active");
     eprintln!("  agent lib : {}", agent_lib.display());
     eprintln!("  socket    : {}", socket_path.display());
-    eprintln!("  command   : {}", cli.command.join(" "));
+    eprintln!("  command   : {}", args.command.join(" "));
     eprintln!(
         "phantom: traces stored in {}",
-        store_path_display(&cli.data_dir)
+        store_path_display(&args.data_dir)
     );
 
     // Spawn the target process with LD_PRELOAD and PHANTOM_SOCKET set.
-    let child = std::process::Command::new(&cli.command[0])
-        .args(&cli.command[1..])
+    let child = std::process::Command::new(&args.command[0])
+        .args(&args.command[1..])
         .env("LD_PRELOAD", &agent_lib)
         .env("PHANTOM_SOCKET", &socket_path)
         .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn {:?}: {e}", cli.command[0]))?;
+        .map_err(|e| anyhow::anyhow!("failed to spawn {:?}: {e}", args.command[0]))?;
 
     eprintln!("phantom: spawned PID {}", child.id());
 
-    match cli.output {
+    match args.output {
         OutputMode::Tui => {
             // In TUI mode the user quits manually; child runs in background.
             phantom_tui::run_tui(store, trace_rx, &backend_name).await?;

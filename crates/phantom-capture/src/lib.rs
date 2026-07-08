@@ -5,7 +5,7 @@ mod proxy;
 mod ldpreload;
 
 pub use fault::{FaultConfig, FaultRule, parse_fault_spec};
-pub use proxy::ProxyCaptureBackend;
+pub use proxy::{CaPaths, ProxyCaptureBackend, ensure_ca};
 
 #[cfg(target_os = "linux")]
 pub use ldpreload::LdPreloadCaptureBackend;
