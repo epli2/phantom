@@ -15,7 +15,7 @@ only, regardless of runtime, and has no HTTPS story.
 |---|---|---|---|---|
 | Node.js (`http`/`https`/`axios`/`undici`/`fetch`) | ✅ | ✅ | Nothing — phantom auto-injects `proxy-preload.js` via `--require` | `tests/proxy_node_integration.rs` |
 | curl | ✅ | ✅ | Nothing — `HTTP_PROXY`/`HTTPS_PROXY` + `CURL_CA_BUNDLE` are auto-set | `tests/proxy_curl_https_integration.rs`, `tests/proxy_gzip_integration.rs` |
-| Python 3 (`urllib.request` stdlib) | ✅ | ✅ | Nothing — `HTTP_PROXY`/`HTTPS_PROXY` + `SSL_CERT_FILE` are auto-set and honoured by Python's OpenSSL-backed `ssl` module | `tests/proxy_python_integration.rs` |
+| Python 3 (`urllib.request` stdlib) | ✅ | ✅ (see limitation 3 on strict OpenSSL/LibreSSL builds) | Nothing — `HTTP_PROXY`/`HTTPS_PROXY` + `SSL_CERT_FILE` are auto-set and honoured by Python's OpenSSL-backed `ssl` module | `tests/proxy_python_integration.rs` |
 | Python 3 (`requests`) | Expected to work (untested) | Expected to work (untested) | Same as above; `requests` additionally reads `REQUESTS_CA_BUNDLE`, which phantom also sets | — |
 | Go (`net/http`) | ✅ (non-loopback targets only) | ❌ (see limitation 2) | `HTTP_PROXY` auto-set; target host must not be `localhost`/loopback (see limitation 1) | `tests/proxy_go_integration.rs` |
 | Java (JDK HttpClient, Apache HttpClient 5) | ✅ | ✅ | Nothing — phantom injects `-javaagent` + JVM proxy system properties via `JAVA_TOOL_OPTIONS` (see PR #4) | `tests/proxy_java_clients_integration.rs` |
@@ -70,6 +70,38 @@ IP-literal HTTPS targets will fail TLS verification client-side, independent of 
 language/runtime is used. This is a real gap in phantom's own cert generation, not a
 per-runtime quirk — fixing it (teach `proxy.rs`'s CA/cert path to add an IP SAN when the
 CONNECT authority parses as an IP) is tracked as future work, not fixed in this pass.
+
+### 3. phantom's MITM leaf certificates never carry an Authority Key Identifier
+
+`hudsucker::certificate_authority::RcgenAuthority` (the MITM certificate generator
+phantom uses) builds every per-site leaf certificate from `rcgen::CertificateParams
+::default()`, which leaves `use_authority_key_identifier_extension` at its default of
+`false`. Confirmed against both the pinned `hudsucker 0.22.0` and the latest upstream
+`main` branch — this is not fixed in a newer release, it is how `RcgenAuthority::gen_cert`
+is written today, and there is no public API to opt in without replacing the
+`CertificateAuthority` implementation entirely.
+
+Most TLS stacks tolerate a leaf certificate without an AKI extension (it's optional per
+RFC 5280 for certs whose issuer can be identified another way). Some don't: macOS's
+Homebrew-built Python 3.14 (linked against a stricter OpenSSL/LibreSSL) rejects it
+outright:
+
+```
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify
+failed: Missing Authority Key Identifier
+```
+
+Practical impact: HTTPS interception can fail client-side on TLS stacks that enforce
+this strictly, independent of which language/runtime is used — it's a property of the
+generated certificate, not of any particular client. `tests/proxy_python_integration.rs`
+detects exactly this failure (via a distinct marker printed by
+`tests/apps/python-app/client.py`) and treats it as a known, non-regression outcome
+rather than a test failure, so the HTTP leg of that test still guards against real
+breakage everywhere, and the HTTPS leg still guards against it wherever the local
+OpenSSL/LibreSSL build is lenient (e.g. Linux CI). A proper fix requires phantom to stop
+using `RcgenAuthority` and implement `hudsucker::certificate_authority::CertificateAuthority`
+directly so it can set `use_authority_key_identifier_extension = true` on generated leaf
+certs; tracked as future work, not fixed in this pass.
 
 ## How to add a runtime to this matrix
 
