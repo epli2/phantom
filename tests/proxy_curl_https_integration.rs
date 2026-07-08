@@ -141,6 +141,12 @@ fn test_curl_https_verifies_phantom_ca_without_insecure_flag() {
         .arg("--")
         .arg("curl")
         .arg("-sS")
+        // Discard curl's own stdout: it shares phantom's inherited stdout,
+        // and interleaving curl's response body with phantom's JSONL lines
+        // (no synchronization between the two processes) corrupts the JSONL
+        // stream. The captured trace is asserted below instead.
+        .arg("-o")
+        .arg("/dev/null")
         // NOTE: no -k / --insecure here. curl must verify the MITM'd cert
         // via CURL_CA_BUNDLE, and route via HTTPS_PROXY — both set by phantom.
         .arg(format!("https://localhost:{https_port}/api/health"))

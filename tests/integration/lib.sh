@@ -286,13 +286,14 @@ PYEOF
 # Usage: output=$(run_phantom_capture "curl -s http://...")
 run_phantom_capture() {
     local cmd="$1"
-    # Filter to only phantom JSONL lines (containing "trace_id").
-    # The child process (curl) shares stdout with phantom, so its body output
-    # may be interleaved.  We match on "trace_id" which is unique to phantom's
-    # output, then extract the JSON object.
+    # Filter to only phantom JSONL lines. The child process (curl) shares
+    # stdout with phantom, so its body output may be interleaved. Every
+    # phantom JSONL record starts with "schema_version" (see
+    # docs/jsonl-schema.md), which is unique to phantom's output, so we
+    # match on that and extract the JSON object.
     timeout 10 "$PHANTOM" --backend ldpreload --output jsonl \
         --agent-lib "$AGENT_LIB" -- $cmd 2>/dev/null \
-        | grep -o '{"timestamp_ms".*}$' || true
+        | grep -o '{"schema_version".*}$' || true
 }
 
 # ── Assertion helpers ────────────────────────────────────────────────────────
