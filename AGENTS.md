@@ -15,8 +15,11 @@ crates/
   phantom-tui/               # Ratatui terminal UI
   phantom-agent/             # LD_PRELOAD dylib (Linux only, hooks libc send/recv)
 tests/
-  proxy_node_integration.rs  # Integration tests: Node.js proxy capture (HTTP + HTTPS)
+  proxy_node_integration.rs           # Integration tests: Node.js proxy capture (HTTP + HTTPS)
+  proxy_php_integration.rs            # Integration test: PHP curl via proxy backend (HTTP + HTTPS)
+  proxy_php_ldpreload_integration.rs  # Integration test: PHP curl via ldpreload backend (Linux only)
   apps/node-app/             # Test Node.js app (client.js, client-alts.js, proxy-preload.js)
+  apps/php-app/              # Test PHP app (client.php, curl extension, PHP 5.3-compatible)
   integration/               # Shell-based integration tests
 Cargo.toml                   # Workspace root + binary crate
 plan.md                      # Japanese-language technical design document
@@ -66,13 +69,15 @@ make check    # fmt + clippy + build + test (full CI locally)
 
 | Flag | Default | Description |
 |---|---|---|
-| `-b, --backend <BACKEND>` | `proxy` | `proxy` (MITM, cross-platform) or `ldpreload` (Linux only) |
+| `-b, --backend <BACKEND>` | `proxy` | `proxy` (MITM, cross-platform) or `ldpreload` (Linux only, HTTP + HTTPS) |
 | `-o, --output <OUTPUT>` | `tui` | `tui` (interactive) or `jsonl` (stdout stream, auto-exits with child) |
 | `-p, --port <PORT>` | `8080` | Proxy capture port |
 | `--insecure` | off | Disable TLS verification for backend servers (self-signed certs) |
 | `-d, --data-dir <DIR>` | `~/.local/share/phantom/data` | Storage directory |
 | `--agent-lib <PATH>` | — | Path to `libphantom_agent.so` (ldpreload backend) |
 | `-- <CMD>` | — | Command to spawn and trace automatically |
+
+For any spawned command other than Node.js, phantom sets `HTTP_PROXY`/`HTTPS_PROXY` (and lowercase variants) and clears `NO_PROXY`/`no_proxy`, so libcurl-based clients (curl, PHP's curl extension, etc.) are proxied for both schemes without an inherited `no_proxy` exclusion list defeating capture. Node.js is excluded from this because its injected `proxy-preload.js` already handles HTTPS itself — setting `HTTPS_PROXY` there would make libraries like axios configure a second, conflicting proxy agent from the env var.
 
 ---
 
@@ -101,6 +106,25 @@ When the command after `--` is `node` or `nodejs`, phantom automatically:
 **Double-proxy guard**: axios auto-reads `HTTP_PROXY` and formats an absolute-URI request. The `http.request` patch detects this (absolute URI path + target == proxy host:port) and skips re-wrapping.
 
 **fetch HTTP CONNECT issue**: undici's `ProxyAgent` uses `CONNECT` for all `fetch()` requests. Phantom handles `CONNECT` as HTTPS MITM, which breaks plain HTTP. Fix: `proxy-preload.js` patches `globalThis.fetch` to intercept `http://` URLs and route them through `http.request` directly.
+
+---
+
+## PHP Transparent Proxy Injection (curl)
+
+When the command after `--` is `php` (or a version-suffixed binary like `php8.2`), phantom automatically:
+
+1. Exports the MITM CA certificate (generated fresh per run in `ProxyCaptureBackend`, see `crates/phantom-capture/src/proxy.rs`) to a PID-scoped temp PEM file.
+2. Prepends `-d curl.cainfo=<tempfile>` to the PHP arguments.
+3. Sets `HTTP_PROXY` / `HTTPS_PROXY` (and lowercase variants), and clears `NO_PROXY` / `no_proxy`.
+4. Deletes the temp CA file after the child exits (`TempScript` RAII guard, same mechanism as Node/Java).
+
+Unlike Node.js, PHP requires **no injected script**: libcurl (the library backing PHP's curl extension) already reads `HTTP_PROXY`/`HTTPS_PROXY` env vars natively when the application hasn't called `curl_setopt($ch, CURLOPT_PROXY, ...)` itself, so routing traffic through the proxy needs no code injection. The only gap is TLS trust — PHP has no way to monkey-patch `curl_setopt` calls from userland, so phantom cannot force-disable certificate verification the way it does for Node/Java. Instead it exports its own MITM CA and injects it via the `curl.cainfo` ini directive, which the curl extension uses as the default CA bundle whenever the application hasn't set `CURLOPT_CAINFO`/`CURLOPT_SSL_VERIFYPEER` itself.
+
+**Known limitations:**
+- Only the **curl extension** is covered. PHP streams (`file_get_contents`, `fopen` with `http://`/`https://` wrappers) and non-curl HTTP clients are out of scope.
+- `curl.cainfo` requires **PHP ≥ 5.3.7** (added in that release). On PHP 5.3.0–5.3.6, HTTP capture still works (via `HTTP_PROXY`/`HTTPS_PROXY`) but HTTPS capture fails TLS verification unless the application itself disables it.
+- If the application explicitly sets `CURLOPT_CAINFO` or `CURLOPT_SSL_VERIFYPEER`, phantom's injected `curl.cainfo` default is overridden and HTTPS capture may fail with a TLS error — the same class of limitation as Node's double-proxy guard.
+- `--backend ldpreload` (Linux only) requires **no PHP-specific code at all**: it hooks libc `send`/`recv` and OpenSSL `SSL_write`/`SSL_read` at a language-agnostic level, so it captures PHP's curl-based HTTP and HTTPS traffic (no MITM cert involved) exactly like it does for any other dynamically-linked process. See `tests/proxy_php_ldpreload_integration.rs`.
 
 ---
 
@@ -154,6 +178,13 @@ cargo test --test proxy_node_integration -- --nocapture
 # Single test function:
 cargo test --test proxy_node_integration test_proxy_captures_node_app_traffic -- --nocapture
 cargo test --test proxy_node_integration test_proxy_captures_alternative_http_clients -- --nocapture
+
+# PHP curl proxy integration test (requires php with the curl extension in PATH)
+cargo test --test proxy_php_integration -- --nocapture
+
+# PHP curl ldpreload integration test (Linux only; builds phantom-agent on demand)
+cargo build -p phantom-agent
+cargo test --test proxy_php_ldpreload_integration -- --nocapture
 ```
 
 ### Node.js Integration Tests (`tests/proxy_node_integration.rs`)
@@ -169,6 +200,15 @@ Both tests:
 - Run `phantom --output jsonl --insecure -- node <script>.js`.
 - Parse JSONL output and assert method, path, status code per trace.
 - Identify traces by `x-phantom-client` custom header in `request_headers`.
+
+### PHP Integration Tests
+
+| Test | Description |
+|------|-------------|
+| `tests/proxy_php_integration.rs` | `proxy` backend: PHP curl HTTP + HTTPS via injected `-d curl.cainfo=` (real CA verification, no bypass) — 4 traces |
+| `tests/proxy_php_ldpreload_integration.rs` | `ldpreload` backend (Linux only): PHP curl HTTP + HTTPS via libc/OpenSSL hooks, zero PHP-specific code — 4 traces |
+
+Both auto-skip if `php` (or its curl extension) is not available. `client.php` (shared by both tests, `tests/apps/php-app/client.php`) is written in PHP 5.3-compatible syntax and takes an optional `PHANTOM_TEST_INSECURE` env var to disable curl peer verification for the ldpreload test, where there is no phantom CA to trust against the mock backend's self-signed cert.
 
 ### Run a Single Unit Test Function
 
@@ -312,14 +352,17 @@ pub enum StorageError {
 | `tests/apps/node-app/client.js` | Test client: `http`/`https` module usage (basic integration test) |
 | `tests/apps/node-app/client-alts.js` | Test client: `axios`, `undici`, `globalThis.fetch` (alternative HTTP clients test) |
 | `tests/apps/node-app/package.json` | Node app deps: `axios ^1.7`, `undici ^7` |
+| `tests/proxy_php_integration.rs` | Integration test: PHP curl HTTP/HTTPS via `proxy` backend (`-d curl.cainfo=` injection) |
+| `tests/proxy_php_ldpreload_integration.rs` | Integration test: PHP curl HTTP/HTTPS via `ldpreload` backend (Linux only) |
+| `tests/apps/php-app/client.php` | Test client: curl extension, PHP 5.3-compatible syntax; shared by both PHP tests |
 | `crates/phantom-core/src/trace.rs` | `HttpTrace`, `TraceId`, `SpanId`, `HttpMethod` |
 | `crates/phantom-core/src/storage.rs` | `TraceStore` trait |
 | `crates/phantom-core/src/capture.rs` | `CaptureBackend` trait |
 | `crates/phantom-core/src/error.rs` | `CaptureError`, `StorageError` |
 | `crates/phantom-storage/src/fjall_store.rs` | Storage implementation + all storage tests |
-| `crates/phantom-capture/src/proxy.rs` | MITM proxy implementation (cross-platform) |
+| `crates/phantom-capture/src/proxy.rs` | MITM proxy implementation (cross-platform); also exposes `ca_cert_pem()` for PHP `curl.cainfo` injection |
 | `crates/phantom-capture/src/ldpreload.rs` | LD_PRELOAD capture backend (Linux only) |
-| `crates/phantom-agent/src/lib.rs` | LD_PRELOAD dylib: hooks libc `send`/`recv`/`close` |
+| `crates/phantom-agent/src/lib.rs` | LD_PRELOAD dylib: hooks libc `send`/`recv`/`close` and OpenSSL `SSL_write`/`SSL_read` (HTTPS) |
 | `crates/phantom-tui/src/app.rs` | TUI state (`App`) and all state mutation |
 | `crates/phantom-tui/src/ui.rs` | Ratatui rendering functions |
 | `crates/phantom-tui/src/lib.rs` | TUI entry point and event loop |

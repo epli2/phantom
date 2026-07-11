@@ -25,6 +25,7 @@ pub struct ProxyCaptureBackend {
     fault_config: FaultConfig,
     shutdown_tx: Option<oneshot::Sender<()>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    ca_cert_pem: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ProxyCaptureBackend {
@@ -35,6 +36,7 @@ impl ProxyCaptureBackend {
             fault_config: FaultConfig::default(),
             shutdown_tx: None,
             task_handle: None,
+            ca_cert_pem: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -42,6 +44,15 @@ impl ProxyCaptureBackend {
     pub fn with_faults(mut self, config: FaultConfig) -> Self {
         self.fault_config = config;
         self
+    }
+
+    /// Returns the PEM-encoded MITM CA certificate once the proxy has started.
+    ///
+    /// `None` until `start()` has generated the CA (which happens before the
+    /// proxy begins listening, so it is always available once the proxy port
+    /// is confirmed to be accepting connections).
+    pub fn ca_cert_pem(&self) -> Option<String> {
+        self.ca_cert_pem.lock().unwrap().clone()
     }
 }
 
@@ -58,9 +69,11 @@ impl CaptureBackend for ProxyCaptureBackend {
 
         let port = self.listen_port;
         let insecure = self.insecure;
+        let ca_cert_pem = Arc::clone(&self.ca_cert_pem);
 
         let task_handle = tokio::spawn(async move {
             let (key_pair, ca_cert) = generate_ca();
+            *ca_cert_pem.lock().unwrap() = Some(ca_cert.pem());
             let ca = RcgenAuthority::new(key_pair, ca_cert, 1000);
 
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
