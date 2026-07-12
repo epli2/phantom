@@ -153,6 +153,7 @@ fn test_fault_error_always() {
     // no_proxy / NO_PROXY must be cleared so curl routes 127.0.0.1 through the proxy.
     let out = Command::new(phantom_bin)
         .args([
+            "run",
             "--backend",
             "proxy",
             "--output",
@@ -252,6 +253,7 @@ fn test_fault_delay_adds_latency() {
 
     let out = Command::new(phantom_bin)
         .args([
+            "run",
             "--backend",
             "proxy",
             "--output",
@@ -337,6 +339,7 @@ fn test_fault_url_pattern_filter() {
 
     let out1 = Command::new(phantom_bin)
         .args([
+            "run",
             "--backend",
             "proxy",
             "--output",
@@ -384,6 +387,7 @@ fn test_fault_url_pattern_filter() {
 
     let out2 = Command::new(phantom_bin)
         .args([
+            "run",
             "--backend",
             "proxy",
             "--output",

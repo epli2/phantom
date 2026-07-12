@@ -1,708 +1,119 @@
-use std::path::{Path, PathBuf};
+mod cli;
+mod commands;
+mod mcp;
+mod runner;
+
+use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
 
-use clap::{Parser, ValueEnum};
-use phantom_capture::{FaultConfig, ProxyCaptureBackend};
-use phantom_core::capture::CaptureBackend;
-use phantom_core::storage::TraceStore;
-use phantom_core::trace::HttpTrace;
+use clap::Parser;
 use phantom_storage::FjallTraceStore;
-use serde::Serialize;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Embedded proxy preload script (Node.js transparent injection)
-// ─────────────────────────────────────────────────────────────────────────────
+use cli::{Backend, Cli, Commands, GlobalOpts, default_data_dir};
 
-/// The proxy-preload.js content, embedded at compile time.
-/// Written to a temp file when tracing Node.js processes via `phantom -- node …`.
-const NODE_PROXY_PRELOAD: &str = include_str!("../tests/apps/node-app/proxy-preload.js");
-
-/// The Java Agent JAR, embedded at compile time.
-/// Written to a temp file when tracing Java processes via `phantom -- java …`.
-const JAVA_AGENT_JAR: &[u8] = include_bytes!("../crates/phantom-java-agent/phantom-java-agent.jar");
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CLI
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, ValueEnum)]
-enum Backend {
-    /// MITM proxy — captures HTTP + HTTPS, cross-platform. Node.js HTTPS injected automatically.
-    Proxy,
-    /// LD_PRELOAD agent — captures HTTP + HTTPS, Linux only. No proxy config needed.
-    #[cfg(target_os = "linux")]
-    Ldpreload,
-}
-
-#[derive(Debug, Clone, Default, ValueEnum)]
-enum OutputMode {
-    /// Interactive terminal UI with trace list and detail view.
-    #[default]
-    Tui,
-    /// Stream traces as JSON Lines to stdout; auto-exits when child process finishes.
-    Jsonl,
-}
-
-#[derive(Parser)]
-#[command(
-    name = "phantom",
-    about = "Zero-instrumentation HTTP/HTTPS API observability tool",
-    long_about = "phantom — Zero-instrumentation HTTP/HTTPS API observability\n\
-\n\
-Captures every HTTP and HTTPS request/response made by a target process\n\
-and displays them in an interactive TUI or streams them as JSON Lines.\n\
-The target application requires NO code changes.\n\
-\n\
-━━━ CAPTURE BACKENDS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
-\n\
-  proxy  (default, cross-platform)\n\
-    Starts a MITM proxy on 127.0.0.1:<PORT>.  Intercepts HTTP and HTTPS.\n\
-\n\
-    • Node.js  (`phantom -- node app.js`)\n\
-      proxy-preload.js is injected automatically via --require.  Both http://\n\
-      and https:// are captured with zero application changes.\n\
-\n\
-    • PHP  (`phantom -- php app.php`)\n\
-      The MITM CA certificate is injected automatically via -d curl.cainfo=.\n\
-      curl-based HTTP and HTTPS (incl. Guzzle's default handler) are captured\n\
-      with zero application changes.  Requires PHP >= 5.3.7 for curl.cainfo;\n\
-      only the curl extension is covered (not PHP streams).\n\
-\n\
-    • Other commands  (`phantom -- curl http://api.example.com/v1`)\n\
-      HTTP_PROXY / HTTPS_PROXY (and lowercase variants) are set automatically.\n\
-      Plain HTTP is captured; HTTPS is captured if the application honours\n\
-      these env vars for CONNECT tunnelling (as libcurl does by default).\n\
-\n\
-    • Manual  (start phantom alone, then configure your app)\n\
-      Set HTTP_PROXY=http://127.0.0.1:8080 in the target process yourself.\n\
-\n\
-  ldpreload  (Linux only)\n\
-    Injects libphantom_agent.so via LD_PRELOAD.  Hooks send/recv/close at\n\
-    the libc level for plain HTTP, and OpenSSL SSL_write/SSL_read for HTTPS\n\
-    (captured above the TLS layer, before encryption). No proxy config\n\
-    required and no MITM certificate involved — works for any dynamically\n\
-    linked process, language-agnostic (e.g. PHP's curl extension).\n\
-\n\
-━━━ OUTPUT MODES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
-\n\
-  tui   (default) — Interactive terminal UI with trace list + detail view.\n\
-\n\
-  jsonl — One JSON object per line on stdout.  phantom exits automatically\n\
-          when the child process exits (ideal for scripting and AI agents).\n\
-\n\
-  JSONL record schema (all fields always present unless marked optional):\n\
-    trace_id          string   W3C-compatible 128-bit trace ID (hex, 32 chars)\n\
-    span_id           string   64-bit span ID (hex, 16 chars)\n\
-    timestamp_ms      number   Unix epoch milliseconds — request start time\n\
-    duration_ms       number   Round-trip latency in milliseconds\n\
-    method            string   HTTP verb: \"GET\", \"POST\", \"PUT\", \"DELETE\", …\n\
-    url               string   Full request URL (scheme + host + path + query)\n\
-    status_code       number   HTTP response status code (200, 404, 500, …)\n\
-    protocol_version  string   HTTP version string, e.g. \"HTTP/1.1\"\n\
-    request_headers   object   Lower-cased header names → values\n\
-    response_headers  object   Lower-cased header names → values\n\
-    request_body      string?  UTF-8 decoded body; omitted when empty\n\
-    response_body     string?  UTF-8 decoded body; omitted when empty\n\
-    source_addr       string?  Client socket address, e.g. \"127.0.0.1:54321\"\n\
-    dest_addr         string?  Server socket address, e.g. \"93.184.216.34:443\"",
-    after_long_help = "EXAMPLES\n\
-\n\
-  ┌─ Proxy mode (default) ──────────────────────────────────────────────────┐\n\
-\n\
-  # Trace a Node.js app — HTTP + HTTPS captured, zero app changes:\n\
-  phantom -- node app.js\n\
-\n\
-  # Stream traces as JSONL for scripting / AI analysis:\n\
-  phantom --output jsonl -- node app.js\n\
-\n\
-  # Allow self-signed TLS certs on backend servers:\n\
-  phantom --insecure --output jsonl -- node app.js\n\
-\n\
-  # Trace a PHP app — curl-based HTTP + HTTPS captured, zero app changes:\n\
-  phantom -- php app.php\n\
-\n\
-  # Trace any command (plain HTTP only, HTTPS if app uses HTTP_PROXY CONNECT):\n\
-  phantom -- curl http://api.example.com/v1/users\n\
-\n\
-  # Start proxy only, configure target app manually:\n\
-  phantom\n\
-  # then in another shell:\n\
-  HTTP_PROXY=http://127.0.0.1:8080 node app.js\n\
-\n\
-  # Custom port, custom data directory:\n\
-  phantom --port 9090 --data-dir ./traces -- node app.js\n\
-\n\
-  └─────────────────────────────────────────────────────────────────────────┘\n\
-\n\
-  ┌─ LD_PRELOAD mode (Linux only) ──────────────────────────────────────────┐\n\
-\n\
-  # Build the agent first:\n\
-  cargo build -p phantom-agent\n\
-\n\
-  # Trace a process (HTTP + HTTPS, no MITM certificate needed):\n\
-  phantom --backend ldpreload \\\n\
-          --agent-lib ./target/debug/libphantom_agent.so \\\n\
-          -- curl http://api.example.com/v1/users\n\
-\n\
-  └─────────────────────────────────────────────────────────────────────────┘\n\
-\n\
-  ┌─ Consume JSONL from another process ────────────────────────────────────┐\n\
-\n\
-  phantom --output jsonl -- node app.js \\\n\
-    | jq 'select(.status_code >= 400)'          # filter errors\n\
-\n\
-  phantom --output jsonl -- node app.js \\\n\
-    | jq '{method,url,status_code,duration_ms}' # compact summary\n\
-\n\
-  └─────────────────────────────────────────────────────────────────────────┘",
-    version
-)]
-struct Cli {
-    /// Capture backend: 'proxy' (MITM, cross-platform) or 'ldpreload' (Linux, HTTP + HTTPS).
-    #[arg(short, long, value_enum, default_value = "proxy")]
-    backend: Backend,
-
-    /// Output mode: 'tui' opens the interactive UI; 'jsonl' streams one trace
-    /// per line to stdout and exits when the child process finishes.
-    #[arg(short, long, value_enum, default_value = "tui")]
-    output: OutputMode,
-
-    /// TCP port the proxy listens on.
-    #[arg(short, long, default_value = "8080")]
-    port: u16,
-
-    /// Disable TLS certificate verification for connections to backend servers.
-    /// Use when tracing apps that talk to servers with self-signed certificates.
-    #[arg(long, default_value = "false")]
-    insecure: bool,
-
-    /// Directory where captured traces are persisted (Fjall key-value store).
-    /// Defaults to the platform data directory, e.g. ~/.local/share/phantom/data.
-    #[arg(short, long)]
-    data_dir: Option<PathBuf>,
-
-    /// Path to libphantom_agent.so  [required for --backend ldpreload]
-    ///
-    /// Build with: cargo build -p phantom-agent
-    /// Then pass:  --agent-lib ./target/debug/libphantom_agent.so
-    #[arg(long, value_name = "PATH")]
-    agent_lib: Option<PathBuf>,
-
-    /// Inject faults into proxied requests (proxy backend only).
-    ///
-    /// SPEC formats:
-    ///   delay:100ms              fixed 100 ms delay on all requests
-    ///   delay:100ms-500ms        random delay in the given range
-    ///   delay:200ms:/api         delay only URLs containing "/api"
-    ///   error:503                return HTTP 503 for all requests
-    ///   error:503:0.5            return HTTP 503 with 50% probability
-    ///   error:500:0.1:/api       10% chance of HTTP 500 on URLs containing "/api"
-    ///
-    /// Rules are applied in order; delays and errors can be combined.
-    /// Repeat the flag to add multiple rules:
-    ///   --fault delay:50ms --fault error:500:0.1
-    #[arg(long, value_name = "SPEC")]
-    fault: Vec<String>,
-
-    /// Command to spawn and trace (everything after `--`).
-    ///
-    /// proxy mode:     HTTP_PROXY is set automatically; Node.js additionally
-    ///                 gets proxy-preload.js injected via --require (captures HTTPS too).
-    /// ldpreload mode: LD_PRELOAD + PHANTOM_SOCKET are set automatically.
-    #[arg(last = true, value_name = "CMD")]
-    command: Vec<String>,
-}
-
-fn default_data_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("phantom")
-        .join("data")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// JSONL output
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Human-friendly, fully serializable representation of an `HttpTrace`.
-/// Emitted as one JSON object per line to stdout in `--output jsonl` mode.
-#[derive(Serialize)]
-struct JsonlTrace {
-    /// Unix timestamp of the request in milliseconds.
-    timestamp_ms: u64,
-    /// Round-trip duration in milliseconds.
-    duration_ms: u64,
-    /// HTTP method ("GET", "POST", …).
-    method: String,
-    /// Full request URL.
-    url: String,
-    /// HTTP response status code.
-    status_code: u16,
-    /// Request headers (lower-cased keys).
-    request_headers: std::collections::HashMap<String, String>,
-    /// Response headers (lower-cased keys).
-    response_headers: std::collections::HashMap<String, String>,
-    /// Request body decoded as UTF-8 (replacement chars for non-UTF-8 bytes).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    request_body: Option<String>,
-    /// Response body decoded as UTF-8 (replacement chars for non-UTF-8 bytes).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_body: Option<String>,
-    /// Source socket address, if available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_addr: Option<String>,
-    /// Destination socket address, if available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dest_addr: Option<String>,
-    /// HTTP protocol version string (e.g. "HTTP/1.1").
-    protocol_version: String,
-    /// 128-bit W3C trace ID (hex).
-    trace_id: String,
-    /// 64-bit span ID (hex).
-    span_id: String,
-}
-
-fn body_to_str(body: &Option<Vec<u8>>) -> Option<String> {
-    body.as_ref()
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-}
-
-fn trace_to_jsonl(t: &HttpTrace) -> JsonlTrace {
-    let timestamp_ms = t
-        .timestamp
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
-    JsonlTrace {
-        timestamp_ms,
-        duration_ms: t.duration.as_millis() as u64,
-        method: t.method.to_string(),
-        url: t.url.clone(),
-        status_code: t.status_code,
-        request_headers: t.request_headers.clone(),
-        response_headers: t.response_headers.clone(),
-        request_body: body_to_str(&t.request_body),
-        response_body: body_to_str(&t.response_body),
-        source_addr: t.source_addr.clone(),
-        dest_addr: t.dest_addr.clone(),
-        protocol_version: t.protocol_version.clone(),
-        trace_id: t.trace_id.to_string(),
-        span_id: t.span_id.to_string(),
+/// Maps a child process's exit status onto our own exit code:
+/// the child's code clamped to u8, or 128+signal on Unix signal death.
+fn exit_code_from_status(status: std::process::ExitStatus) -> ExitCode {
+    if let Some(code) = status.code() {
+        return ExitCode::from(code.clamp(0, 255) as u8);
     }
-}
-
-/// Runs the JSONL output loop: each captured trace is serialized and written to
-/// stdout as a single JSON object followed by a newline.
-///
-/// Exits when:
-/// - The trace channel is closed (sender dropped),
-/// - Ctrl-C is received, or
-/// - The optional `child` process exits (ldpreload mode).
-async fn run_jsonl_output(
-    store: Arc<FjallTraceStore>,
-    mut trace_rx: tokio::sync::mpsc::Receiver<HttpTrace>,
-    child: Option<std::process::Child>,
-) -> anyhow::Result<()> {
-    // Spawn a background thread to wait() on the child so we don't block the
-    // async executor.  Signal completion via a oneshot channel.
-    let mut child_done: Option<tokio::sync::oneshot::Receiver<()>> = if let Some(mut c) = child {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let _ = c.wait();
-            let _ = tx.send(());
-        });
-        Some(rx)
-    } else {
-        None
-    };
-
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-
-    loop {
-        tokio::select! {
-            maybe_trace = trace_rx.recv() => {
-                match maybe_trace {
-                    Some(t) => {
-                        store.insert(&t).ok();
-                        println!("{}", serde_json::to_string(&trace_to_jsonl(&t))?);
-                    }
-                    None => break,
-                }
-            }
-            _ = &mut ctrl_c => break,
-            // When the child exits, wait briefly for the backend to flush any
-            // in-flight datagrams, then drain whatever arrived.
-            _ = async {
-                if let Some(rx) = child_done.as_mut() {
-                    let _ = rx.await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                while let Ok(t) = trace_rx.try_recv() {
-                    store.insert(&t).ok();
-                    println!("{}", serde_json::to_string(&trace_to_jsonl(&t))?);
-                }
-                break;
-            }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return ExitCode::from(128u8.saturating_add(signal.clamp(0, 127) as u8));
         }
     }
-
-    Ok(())
+    ExitCode::FAILURE
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────────────────────
+/// Opens the trace store for a query command, adding a hint about fjall's
+/// single-process lock when another phantom instance holds it.
+fn open_store_for_query(data_dir: &std::path::Path) -> anyhow::Result<FjallTraceStore> {
+    FjallTraceStore::open(data_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}\n\
+             hint: another phantom process (run/mcp) may hold the store lock on\n\
+             {}. Stop it first, or query through the running MCP server.",
+            data_dir.display()
+        )
+    })
+}
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
+    let cli = Cli::parse();
+
+    // All diagnostics go to stderr so stdout stays pure JSONL / JSON.
+    let default_directive = if cli.quiet {
+        "phantom=error"
+    } else {
+        "phantom=info"
+    };
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("phantom=info".parse()?),
+                .add_directive(default_directive.parse()?),
         )
         .init();
 
-    let cli = Cli::parse();
-
     let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)?;
+    let globals = GlobalOpts {
+        quiet: cli.quiet,
+        data_dir: data_dir.clone(),
+    };
 
-    let store = Arc::new(FjallTraceStore::open(&data_dir)?);
-
-    match cli.backend {
-        Backend::Proxy => run_proxy(cli, store).await,
-        #[cfg(target_os = "linux")]
-        Backend::Ldpreload => run_ldpreload(cli, store).await,
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Fault injection
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn build_fault_config(specs: &[String]) -> anyhow::Result<FaultConfig> {
-    let mut rules = Vec::new();
-    for spec in specs {
-        let rule = phantom_capture::parse_fault_spec(spec)
-            .map_err(|e| anyhow::anyhow!("--fault {spec:?}: {e}"))?;
-        rules.push(rule);
-    }
-    Ok(FaultConfig { rules })
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Proxy backend
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// RAII guard that deletes a temporary script file on drop.
-struct TempScript(PathBuf);
-
-impl Drop for TempScript {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// Returns `true` if `exe` (path or bare name) resolves to `node` or `nodejs`.
-fn is_node_command(exe: &str) -> bool {
-    let base = Path::new(exe)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(exe);
-    base == "node" || base == "nodejs"
-}
-
-/// Returns `true` if `exe` (path or bare name) resolves to `java` or `javaw`.
-fn is_java_command(exe: &str) -> bool {
-    let base = Path::new(exe)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(exe);
-    base == "java" || base == "javaw"
-}
-
-/// Returns `true` if `exe` (path or bare name) resolves to `php` or a
-/// version-suffixed PHP binary (e.g. `php7.4`, `php8.2`, `php5.3`).
-fn is_php_command(exe: &str) -> bool {
-    let base = Path::new(exe)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(exe);
-    base == "php"
-        || (base.starts_with("php")
-            && !base[3..].is_empty()
-            && base[3..].chars().all(|c| c.is_ascii_digit() || c == '.'))
-}
-
-/// Spawns `command` as a child process routed through the phantom proxy.
-///
-/// * `HTTP_PROXY` / `HTTPS_PROXY` (and lowercase variants) are set so plain
-///   HTTP and HTTP-client-honoured HTTPS (e.g. libcurl) are captured.
-/// * For Node.js executables the embedded proxy-preload script is written to a
-///   temp file and prepended as `--require <path>` so HTTPS is also captured
-///   without touching the application source.
-/// * For Java executables, the phantom-java-agent.jar is injected via -javaagent
-///   to force proxy settings and bypass SSL verification globally.
-/// * For PHP executables, the MITM CA certificate is written to a temp PEM
-///   file and injected via `-d curl.cainfo=<path>` so the curl extension
-///   trusts phantom's HTTPS interception without any application changes.
-///
-/// Returns `(child, Option<TempScript>)`.  The `TempScript` must be kept alive
-/// until after the child exits so the file is not deleted prematurely.
-fn spawn_proxy_child(
-    command: &[String],
-    proxy_port: u16,
-    ca_cert_pem: Option<&str>,
-) -> anyhow::Result<(std::process::Child, Option<TempScript>)> {
-    let exe = &command[0];
-    let proxy_url = format!("http://127.0.0.1:{proxy_port}");
-
-    let mut temp_script: Option<TempScript> = None;
-    let mut actual_args = command[1..].to_vec();
-
-    if is_node_command(exe) {
-        // Write the embedded preload script to a temp file.
-        let script_path =
-            std::env::temp_dir().join(format!("phantom-preload-{}.js", std::process::id()));
-        std::fs::write(&script_path, NODE_PROXY_PRELOAD)
-            .map_err(|e| anyhow::anyhow!("failed to write proxy preload script: {e}"))?;
-        temp_script = Some(TempScript(script_path.clone()));
-
-        // Prepend --require <script> before the rest of the args.
-        let mut args = vec![
-            "--require".to_string(),
-            script_path.to_string_lossy().into_owned(),
-        ];
-        args.extend_from_slice(&command[1..]);
-        actual_args = args;
-    }
-
-    if is_php_command(exe)
-        && let Some(pem) = ca_cert_pem
-    {
-        // Write the MITM CA certificate to a temp PEM file.
-        let ca_path = std::env::temp_dir().join(format!("phantom-ca-{}.pem", std::process::id()));
-        std::fs::write(&ca_path, pem)
-            .map_err(|e| anyhow::anyhow!("failed to write CA cert: {e}"))?;
-        temp_script = Some(TempScript(ca_path.clone()));
-
-        // Prepend -d curl.cainfo=<path> before the rest of the args, so
-        // the curl extension trusts phantom's MITM certificate without
-        // any changes to the application's own curl_setopt() calls.
-        let mut args = vec![
-            "-d".to_string(),
-            format!("curl.cainfo={}", ca_path.display()),
-        ];
-        args.extend_from_slice(&actual_args);
-        actual_args = args;
-    }
-
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(&actual_args)
-        .env("HTTP_PROXY", &proxy_url)
-        .env("http_proxy", &proxy_url);
-
-    // Node.js handles HTTPS itself via the injected proxy-preload.js (a
-    // custom ProxyTunnelAgent / undici ProxyAgent). Setting HTTPS_PROXY here
-    // would make libraries like axios configure their own competing
-    // httpsAgent from the env var, conflicting with that injected agent and
-    // breaking HTTPS capture. So HTTPS_PROXY/NO_PROXY are only set for
-    // non-Node commands (e.g. curl, PHP's curl extension), which rely on
-    // libcurl's native env-var proxy detection instead.
-    if !is_node_command(exe) {
-        cmd.env("HTTPS_PROXY", &proxy_url)
-            .env("https_proxy", &proxy_url)
-            // Clear any inherited no-proxy exclusions (e.g. for `localhost`)
-            // so libcurl doesn't bypass phantom's proxy for local targets.
-            // Mirrors the Java branch's explicit `-Dhttp.nonProxyHosts=` below.
-            .env("NO_PROXY", "")
-            .env("no_proxy", "");
-    }
-
-    // For Java processes, inject proxy settings and the Java Agent via JAVA_TOOL_OPTIONS.
-    if is_java_command(exe) {
-        // Write the embedded Java Agent to a temp file.
-        let agent_path =
-            std::env::temp_dir().join(format!("phantom-agent-{}.jar", std::process::id()));
-        std::fs::write(&agent_path, JAVA_AGENT_JAR)
-            .map_err(|e| anyhow::anyhow!("failed to write java agent jar: {e}"))?;
-        temp_script = Some(TempScript(agent_path.clone()));
-
-        let jvm_opts = format!(
-            " -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={proxy_port} \
-              -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={proxy_port} \
-              -Dhttp.nonProxyHosts= -Dhttps.nonProxyHosts= \
-              -javaagent:{}",
-            agent_path.display()
-        );
-
-        let existing = std::env::var("JAVA_TOOL_OPTIONS").unwrap_or_default();
-        cmd.env("JAVA_TOOL_OPTIONS", format!("{existing}{jvm_opts}"));
-    }
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn {:?}: {e}", exe))?;
-
-    Ok((child, temp_script))
-}
-
-async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
-    let fault_config = build_fault_config(&cli.fault)?;
-    let mut backend = ProxyCaptureBackend::new(cli.port, cli.insecure).with_faults(fault_config);
-    let backend_name = backend.name().to_string();
-    let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // Optionally spawn a child command routed through the proxy.
-    let child_and_script: Option<(std::process::Child, Option<TempScript>)> =
-        if !cli.command.is_empty() {
-            // Wait for the proxy to be ready before spawning the child.
-            wait_for_proxy(cli.port).await?;
-            let ca_cert_pem = backend.ca_cert_pem();
-            let (child, ts) = spawn_proxy_child(&cli.command, cli.port, ca_cert_pem.as_deref())?;
-            eprintln!(
-                "phantom: spawned PID {} → {}",
-                child.id(),
-                cli.command.join(" ")
-            );
-            Some((child, ts))
-        } else {
-            None
-        };
-
-    match cli.output {
-        OutputMode::Tui => {
-            if cli.command.is_empty() {
-                eprintln!("phantom: proxy listening on 127.0.0.1:{}", cli.port);
-                eprintln!("  Set your HTTP proxy to http://127.0.0.1:{}", cli.port);
-                eprintln!(
-                    "  Example: curl -x http://127.0.0.1:{} http://httpbin.org/get",
-                    cli.port
-                );
-            }
-            eprintln!(
-                "phantom: traces stored in {}",
-                store_path_display(&cli.data_dir)
-            );
-            phantom_tui::run_tui(store, trace_rx, &backend_name).await?;
-        }
-        OutputMode::Jsonl => {
-            eprintln!(
-                "phantom: proxy listening on 127.0.0.1:{} [jsonl mode]",
-                cli.port
-            );
-            // Split into child and script guard separately so the TempScript
-            // is NOT dropped until after run_jsonl_output completes (the file
-            // must exist while node is loading it via --require).
-            let (child, _script_guard) = match child_and_script {
-                Some((c, ts)) => (Some(c), ts),
-                None => (None, None),
+    match cli.command {
+        Commands::Run(args) => {
+            let store = Arc::new(FjallTraceStore::open(&data_dir)?);
+            let child_status = match args.backend {
+                Backend::Proxy => commands::run::run_proxy(&globals, args, store).await?,
+                #[cfg(target_os = "linux")]
+                Backend::Ldpreload => commands::run::run_ldpreload(&globals, args, store).await?,
             };
-            run_jsonl_output(store, trace_rx, child).await?;
-            // _script_guard dropped here — temp file deleted after child exits.
+            Ok(child_status
+                .map(exit_code_from_status)
+                .unwrap_or(ExitCode::SUCCESS))
+        }
+        Commands::List(args) => {
+            let store = open_store_for_query(&data_dir)?;
+            commands::query::list(&store, args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Search(args) => {
+            let store = open_store_for_query(&data_dir)?;
+            commands::query::search(&store, args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Get(args) => {
+            let store = open_store_for_query(&data_dir)?;
+            let found = commands::query::get(&store, args)?;
+            Ok(if found {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Commands::Stats => {
+            let store = open_store_for_query(&data_dir)?;
+            commands::query::stats(&store, &data_dir)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Clear(args) => {
+            let store = open_store_for_query(&data_dir)?;
+            let cleared = commands::query::clear(&store, args.yes, globals.quiet)?;
+            Ok(if cleared {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Commands::Mcp => {
+            let store = Arc::new(open_store_for_query(&data_dir)?);
+            mcp::run_mcp(store, data_dir).await?;
+            Ok(ExitCode::SUCCESS)
         }
     }
-
-    backend.stop().map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(())
-}
-
-/// Poll until the proxy port is accepting connections (or timeout after 5 s).
-async fn wait_for_proxy(port: u16) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("proxy did not become ready on port {port} within 5 s");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// LD_PRELOAD backend (Linux only)
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[cfg(target_os = "linux")]
-async fn run_ldpreload(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> {
-    use phantom_capture::LdPreloadCaptureBackend;
-
-    let agent_lib = cli.agent_lib.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "--agent-lib <PATH> is required for --backend ldpreload\n\
-            Example: --agent-lib ./target/debug/libphantom_agent.so"
-        )
-    })?;
-
-    if cli.command.is_empty() {
-        anyhow::bail!(
-            "A command to trace is required for --backend ldpreload.\n\
-            Usage: phantom --backend ldpreload --agent-lib ./libphantom_agent.so -- curl http://example.com"
-        );
-    }
-
-    // Generate a unique socket path for this run.
-    let socket_path = std::env::temp_dir().join(format!(
-        "phantom-{}.sock",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
-
-    let mut backend = LdPreloadCaptureBackend::new(socket_path.clone());
-    let backend_name = backend.name().to_string();
-    let trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    eprintln!("phantom: ldpreload backend active");
-    eprintln!("  agent lib : {}", agent_lib.display());
-    eprintln!("  socket    : {}", socket_path.display());
-    eprintln!("  command   : {}", cli.command.join(" "));
-    eprintln!(
-        "phantom: traces stored in {}",
-        store_path_display(&cli.data_dir)
-    );
-
-    // Spawn the target process with LD_PRELOAD and PHANTOM_SOCKET set.
-    let child = std::process::Command::new(&cli.command[0])
-        .args(&cli.command[1..])
-        .env("LD_PRELOAD", &agent_lib)
-        .env("PHANTOM_SOCKET", &socket_path)
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn {:?}: {e}", cli.command[0]))?;
-
-    eprintln!("phantom: spawned PID {}", child.id());
-
-    match cli.output {
-        OutputMode::Tui => {
-            // In TUI mode the user quits manually; child runs in background.
-            phantom_tui::run_tui(store, trace_rx, &backend_name).await?;
-        }
-        OutputMode::Jsonl => {
-            // In JSONL mode we exit automatically when the child finishes.
-            run_jsonl_output(store, trace_rx, Some(child)).await?;
-        }
-    }
-
-    backend.stop().map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(())
-}
-
-fn store_path_display(override_dir: &Option<PathBuf>) -> String {
-    override_dir
-        .clone()
-        .unwrap_or_else(default_data_dir)
-        .display()
-        .to_string()
 }

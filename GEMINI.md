@@ -6,31 +6,37 @@ Phantom is a next-generation API observability and automatic workflow generation
 
 ### Building and Running
 - **Build the project:** `cargo build`
-- **Run with Proxy (default):** `phantom -- <COMMAND>` (e.g., `phantom -- node app.js`)
+- **Run with Proxy (default):** `phantom run -- <COMMAND>` (e.g., `phantom run -- node app.js`)
 - **Run with LD_PRELOAD (Linux only):**
-  `cargo run -- --backend ldpreload --agent-lib ./target/debug/libphantom_agent.so -- curl http://example.com`
-- **Run in JSONL mode:** `phantom --output jsonl -- <COMMAND>`
+  `cargo run -- run --backend ldpreload --agent-lib ./target/debug/libphantom_agent.so -- curl http://example.com`
+- **Run in JSONL mode:** `phantom run --output jsonl -- <COMMAND>` (exits with the child's exit code)
+- **Query stored traces:** `phantom list --status 5xx --since 10m`, `phantom get <SPAN_ID>`
+- **MCP server for AI agents:** `phantom mcp` (register: `claude mcp add phantom -- phantom mcp`)
 - **Run tests:** `cargo test`
 
 ### Common Examples
 - **Trace a Node.js app (HTTP + HTTPS captured automatically):**
-  `phantom -- node app.js`
+  `phantom run -- node app.js`
 - **Stream traces to jq for filtering:**
-  `phantom --output jsonl -- node app.js | jq 'select(.status_code >= 400)'`
+  `phantom run --output jsonl -- node app.js | jq 'select(.status_code >= 400)'`
 - **Capture plain HTTP for any command:**
-  `phantom -- curl http://api.example.com/v1/users`
+  `phantom run -- curl http://api.example.com/v1/users`
 
-## 🛠 CLI Options
+## 🛠 CLI Structure
+`phantom <SUBCOMMAND>` with global `-d, --data-dir <DIR>` and `-q, --quiet`.
+Subcommands: `run` (capture), `list`/`get`/`search`/`stats`/`clear` (offline queries), `mcp` (MCP server over stdio).
+
+`run` flags:
 - `-b, --backend <BACKEND>`: Capture backend to use (`proxy` or `ldpreload`). Default: `proxy`.
 - `-o, --output <MODE>`: Output mode (`tui` or `jsonl`). Default: `tui`.
 - `-p, --port <PORT>`: Port for the proxy backend. Default: `8080`.
 - `--insecure`: Disable TLS certificate verification for backend connections.
-- `-d, --data-dir <DIR>`: Directory for trace storage. Default: `~/.local/share/phantom/data`.
 - `--agent-lib <PATH>`: Path to `libphantom_agent.so` (required for `ldpreload`).
+- `--max-body <N>` / `--headers-only`: Limit body output in JSONL mode.
 - `-- <COMMAND>`: The command to run with interception injected.
 
 ### JSONL Output Schema
-When using `--output jsonl`, each line is a JSON object with:
+When using `run --output jsonl`, each line is a JSON object with:
 - `trace_id`: W3C-compatible 128-bit trace ID (hex).
 - `span_id`: 64-bit span ID (hex).
 - `timestamp_ms`: Unix epoch milliseconds.
@@ -41,6 +47,8 @@ When using `--output jsonl`, each line is a JSON object with:
 - `protocol_version`: e.g., "HTTP/1.1".
 - `request_headers` / `response_headers`: Header maps.
 - `request_body` / `response_body`: UTF-8 decoded bodies (optional).
+- `request_body_bytes` / `response_body_bytes`: Original body sizes (optional).
+- `request_body_truncated` / `response_body_truncated`: Present when `--max-body` truncated (optional).
 
 ## 🏗 Architecture & Tech Stack
 
@@ -80,7 +88,9 @@ The project is organized as a Rust workspace:
 - **GUI:** Cross-platform desktop interface using **Tauri**.
 
 ## 📂 Key Files
-- `src/main.rs`: CLI entry point and process spawning logic.
+- `src/main.rs`: CLI entry point (subcommand dispatch, exit-code mapping).
+- `src/cli.rs` / `src/runner.rs` / `src/commands/`: clap definitions, child spawning, run/query handlers.
+- `src/mcp/`: MCP server (`rmcp` stdio, capture sessions + trace query tools).
 - `crates/phantom-core/src/trace.rs`: `HttpTrace` definition.
 - `crates/phantom-storage/src/fjall_store.rs`: Primary storage implementation.
 - `crates/phantom-capture/src/proxy.rs`: Proxy-based interception logic.

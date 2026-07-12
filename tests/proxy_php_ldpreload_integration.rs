@@ -221,7 +221,14 @@ fn test_ldpreload_captures_php_curl_traffic() {
     // directly to the backends and the agent captures traffic at the libc /
     // OpenSSL layer underneath it.
     let phantom_output = Command::new(phantom_bin)
-        .args(["--backend", "ldpreload", "--output", "jsonl", "--agent-lib"])
+        .args([
+            "run",
+            "--backend",
+            "ldpreload",
+            "--output",
+            "jsonl",
+            "--agent-lib",
+        ])
         .arg(&agent_lib)
         .arg("--data-dir")
         .arg(tmp_dir.path())

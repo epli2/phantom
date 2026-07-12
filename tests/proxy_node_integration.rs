@@ -185,6 +185,7 @@ fn test_proxy_captures_node_app_traffic() {
     // The proxy-preload.js is injected automatically by phantom for Node.js.
     let phantom_output = Command::new(phantom_bin)
         .args([
+            "run",
             "--backend",
             "proxy",
             "--output",
@@ -402,6 +403,7 @@ fn test_proxy_captures_alternative_http_clients() {
     // AND undici/fetch via setGlobalDispatcher.
     let phantom_output = Command::new(phantom_bin)
         .args([
+            "run",
             "--backend",
             "proxy",
             "--output",

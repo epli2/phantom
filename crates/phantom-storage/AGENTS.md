@@ -49,6 +49,8 @@ crates/phantom-storage/src/
 - `encode_timestamp` uses **big-endian nanoseconds** — critical for correct lexicographic ordering.
 - Error mapping: `.map_err(|e| StorageError::Open(e.to_string()))` pattern throughout. Never use `?` directly on fjall errors (no `From` impl).
 - `search_by_url` is a **full scan** (MVP approach, noted in comment). Acceptable for now.
+- `query()` scans `by_time` (bounded by since/until key range) or the `by_trace_id` prefix, then post-filters with `TraceQuery::matches`; offset is applied after filtering.
+- `open()` takes an advisory flock on `<data-dir>/phantom.lock` — fjall does not lock across processes itself; a second open fails with `StorageError::Open`.
 - `count()` uses `approximate_len()` — not exact.
 
 ## TEST CONVENTIONS

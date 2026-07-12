@@ -1,13 +1,19 @@
 # Phantom — Agent Instructions
 
-Phantom is a Rust-based API observability tool that captures HTTP/HTTPS traffic via a MITM proxy (or LD_PRELOAD agent on Linux) and presents it in a terminal UI or streams it as JSON Lines. It is organized as a Cargo workspace of five library crates plus one binary.
+Phantom is a Rust-based API observability tool that captures HTTP/HTTPS traffic via a MITM proxy (or LD_PRELOAD agent on Linux) and presents it in a terminal UI, streams it as JSON Lines, serves it to AI coding agents over MCP (`phantom mcp`), or answers offline queries (`phantom list/get/search`). It is organized as a Cargo workspace of five library crates plus one binary.
 
 ---
 
 ## Project Layout
 
 ```
-src/main.rs                  # Binary entry point: CLI parsing, component wiring, child-process spawning
+src/main.rs                  # Binary entry point: subcommand dispatch, exit-code mapping, store opening
+src/cli.rs                   # clap derive: Cli, Commands (run/list/get/search/stats/clear/mcp), arg structs
+src/runner.rs                # Child-process spawning: proxy env vars, Node/PHP/Java injection, TempScript
+src/commands/run.rs          # `phantom run`: proxy/ldpreload capture, TUI/JSONL output loops
+src/commands/query.rs        # `phantom list/get/search/stats/clear`: offline store queries
+src/mcp/server.rs            # `phantom mcp`: rmcp stdio server, 7 MCP tools
+src/mcp/session.rs           # MCP capture sessions: CaptureManager, child lifecycle, trace pump
 crates/
   phantom-core/              # Domain types, traits, error types — no I/O
   phantom-storage/           # Fjall LSM-tree TraceStore implementation
@@ -18,6 +24,8 @@ tests/
   proxy_node_integration.rs           # Integration tests: Node.js proxy capture (HTTP + HTTPS)
   proxy_php_integration.rs            # Integration test: PHP curl via proxy backend (HTTP + HTTPS)
   proxy_php_ldpreload_integration.rs  # Integration test: PHP curl via ldpreload backend (Linux only)
+  cli_query_integration.rs            # Integration tests: exit-code propagation, JSONL purity, list/get/clear, store lock UX
+  mcp_stdio_integration.rs            # Integration test: MCP server via raw JSON-RPC over stdio
   apps/node-app/             # Test Node.js app (client.js, client-alts.js, proxy-preload.js)
   apps/php-app/              # Test PHP app (client.php, curl extension, PHP 5.3-compatible)
   integration/               # Shell-based integration tests
@@ -43,11 +51,14 @@ phantom-agent          (standalone dylib, no workspace deps)
 cargo build                          # Debug build
 cargo build --workspace --all-targets --all-features  # Full build (matches CI)
 cargo build --release                # Release build
-cargo run                            # Run proxy on default port 8080
-cargo run -- --port 9090             # Run with custom port
-cargo run -- -- node app.js          # Trace a Node.js app (proxy-preload.js auto-injected)
-cargo run -- --output jsonl -- node app.js  # Stream JSONL and exit when child exits
-cargo run -- --backend ldpreload --agent-lib ./target/debug/libphantom_agent.so -- curl http://example.com
+cargo run -- run                     # Run proxy on default port 8080 (TUI)
+cargo run -- run --port 9090         # Run with custom port
+cargo run -- run -- node app.js      # Trace a Node.js app (proxy-preload.js auto-injected)
+cargo run -- run --output jsonl -- node app.js  # Stream JSONL; exits with the child's exit code
+cargo run -- run --backend ldpreload --agent-lib ./target/debug/libphantom_agent.so -- curl http://example.com
+cargo run -- list --status 5xx --since 10m      # Query stored traces (offline)
+cargo run -- get <SPAN_ID>           # One trace, pretty JSON
+cargo run -- mcp                     # MCP server over stdio (for AI coding agents)
 cargo check                          # Fast type/borrow check (no codegen)
 cargo clippy --workspace --all-targets --all-features -- -D warnings  # Lint (CI-exact)
 cargo fmt --all                      # Format all code
@@ -65,17 +76,39 @@ make test     # cargo test --workspace --all-targets --all-features
 make check    # fmt + clippy + build + test (full CI locally)
 ```
 
-### CLI Options
+### CLI Structure
+
+`phantom <SUBCOMMAND>` with two global flags: `-d, --data-dir <DIR>` (default `~/.local/share/phantom/data`) and `-q, --quiet` (suppress stderr status lines).
+
+| Subcommand | Purpose |
+|---|---|
+| `run` | Capture traffic; optionally spawn and trace a command (`-- <CMD>`) |
+| `list` | Query stored traces (newest first) with filters |
+| `get <SPAN_ID>` | One trace as pretty JSON; exit 1 when not found |
+| `search <PATTERN>` | Shorthand for `list --url <PATTERN>` |
+| `stats` | `{"total_traces": N, "data_dir": "..."}` |
+| `clear --yes` | Delete all traces (refuses without `--yes`) |
+| `mcp` | MCP server over stdio (see MCP Server section) |
+
+**`phantom run` flags:**
 
 | Flag | Default | Description |
 |---|---|---|
 | `-b, --backend <BACKEND>` | `proxy` | `proxy` (MITM, cross-platform) or `ldpreload` (Linux only, HTTP + HTTPS) |
-| `-o, --output <OUTPUT>` | `tui` | `tui` (interactive) or `jsonl` (stdout stream, auto-exits with child) |
+| `-o, --output <OUTPUT>` | `tui` | `tui` (interactive) or `jsonl` (stdout stream; exits with the child's exit code) |
 | `-p, --port <PORT>` | `8080` | Proxy capture port |
 | `--insecure` | off | Disable TLS verification for backend servers (self-signed certs) |
-| `-d, --data-dir <DIR>` | `~/.local/share/phantom/data` | Storage directory |
 | `--agent-lib <PATH>` | — | Path to `libphantom_agent.so` (ldpreload backend) |
+| `--fault <SPEC>` | — | Fault injection rules (repeatable) |
+| `--max-body <N>` | `0` (unlimited) | Truncate bodies in JSONL output to N bytes |
+| `--headers-only` | off | Omit bodies from JSONL output (sizes still reported) |
 | `-- <CMD>` | — | Command to spawn and trace automatically |
+
+**Query flags (`list`/`search`):** `--method <M>` (repeatable), `--status <404|4xx|400-499>`, `--url <SUBSTR>` (list only), `--since/--until <RFC3339 | relative like "10m">`, `--trace-id <HEX32>`, `--limit` (50), `--offset`, `--format <jsonl|json|table>`, `--max-body` (1024, 0 = unlimited), `--headers-only`, `--redact-header <NAME>` (repeatable).
+
+**Exit codes:** `phantom run -o jsonl -- <CMD>` exits with the child's exit code (Unix signal deaths map to 128+signal). In jsonl mode a machine-readable summary line goes to stderr on exit: `{"event":"exit","child_exit_code":N,"traces_captured":N}`. All diagnostics go to stderr; stdout is pure JSONL/JSON.
+
+**Store lock:** `FjallTraceStore::open` takes an advisory `flock` on `<data-dir>/phantom.lock` (fjall itself does not lock across processes). Only one phantom process can use a data dir at a time; query subcommands print a hint when the store is locked by a running `phantom run`/`mcp` — query through the MCP server in that case.
 
 For any spawned command other than Node.js, phantom sets `HTTP_PROXY`/`HTTPS_PROXY` (and lowercase variants) and clears `NO_PROXY`/`no_proxy`, so libcurl-based clients (curl, PHP's curl extension, etc.) are proxied for both schemes without an inherited `no_proxy` exclusion list defeating capture. Node.js is excluded from this because its injected `proxy-preload.js` already handles HTTPS itself — setting `HTTPS_PROXY` there would make libraries like axios configure a second, conflicting proxy agent from the env var.
 
@@ -144,10 +177,40 @@ When `--output jsonl` is used, one JSON object is written per line to stdout. Al
 | `protocol_version` | string | HTTP version string, e.g. `"HTTP/1.1"` |
 | `request_headers` | object | Lower-cased header names → values |
 | `response_headers` | object | Lower-cased header names → values |
-| `request_body` | string? | UTF-8 decoded body; omitted when empty |
-| `response_body` | string? | UTF-8 decoded body; omitted when empty |
+| `request_body` | string? | UTF-8 decoded body; omitted when empty or `--headers-only` |
+| `response_body` | string? | UTF-8 decoded body; omitted when empty or `--headers-only` |
+| `request_body_bytes` | number? | Original request body size in bytes; present when a body existed |
+| `response_body_bytes` | number? | Original response body size in bytes; present when a body existed |
+| `request_body_truncated` | bool? | Present (`true`) when `--max-body` truncated the request body |
+| `response_body_truncated` | bool? | Present (`true`) when `--max-body` truncated the response body |
 | `source_addr` | string? | Client socket address, e.g. `"127.0.0.1:54321"` |
 | `dest_addr` | string? | Server socket address, e.g. `"93.184.216.34:443"` |
+
+The same schema (`phantom_core::view::TraceView`, rendered via `RenderOptions`) is used by `phantom run --output jsonl`, the query subcommands, and MCP tool results.
+
+---
+
+## MCP Server (`phantom mcp`)
+
+`phantom mcp` serves the Model Context Protocol over stdio using the official `rmcp` SDK, so AI coding agents can drive captures and query traces as tools. One process hosts both capture and queries, so the store lock is never contended. Register with Claude Code:
+
+```sh
+claude mcp add phantom -- phantom mcp
+# or with a custom data dir:
+claude mcp add phantom -- phantom --data-dir ./traces mcp
+```
+
+| Tool | Purpose |
+|---|---|
+| `start_capture` | Spawn a command through the MITM proxy (Node/PHP/Java HTTPS injection included) or start a proxy-only session; auto-assigns a free port when none given. Returns `session_id`, `port`, `proxy_url`, `pid` |
+| `capture_status` | Child state (`running`/`exited` + `exit_code`), live `trace_count`; one session or all. Poll this after `start_capture` |
+| `stop_capture` | Kill a still-running child, stop the proxy, return the final status |
+| `list_traces` | Filters: `method`, `status` (`"404"`/`"4xx"`/`"400-499"`), `url_contains`, `since_ms`/`until_ms`, `trace_id`, `limit` (20)/`offset`; bodies default to 256 bytes (`max_body`, 0 = unlimited), `headers_only` |
+| `get_trace` | Full detail by `span_id`; bodies default to 4096 bytes |
+| `get_stats` | Approximate total trace count, data dir, active session count |
+| `clear_traces` | Deletes all traces; requires `confirm: true` |
+
+Sensitive headers (`authorization`, `proxy-authorization`, `cookie`, `set-cookie`) are redacted in tool output by default (`redact_sensitive_headers: false` to disable). Sessions keep capturing after their child exits, until `stop_capture`; all sessions are torn down when the MCP client disconnects (a SIGKILL of the server can orphan traced children).
 
 ---
 
@@ -185,6 +248,12 @@ cargo test --test proxy_php_integration -- --nocapture
 # PHP curl ldpreload integration test (Linux only; builds phantom-agent on demand)
 cargo build -p phantom-agent
 cargo test --test proxy_php_ldpreload_integration -- --nocapture
+
+# CLI query / exit-code / lock UX integration tests (requires curl for the capture parts)
+cargo test --test cli_query_integration -- --nocapture
+
+# MCP server smoke test (raw JSON-RPC over stdio; requires curl for the capture round-trip)
+cargo test --test mcp_stdio_integration -- --nocapture
 ```
 
 ### Node.js Integration Tests (`tests/proxy_node_integration.rs`)
@@ -197,7 +266,7 @@ cargo test --test proxy_php_ldpreload_integration -- --nocapture
 Both tests:
 - Auto-skip if `node` or `npm` is not in `PATH`.
 - Start in-process Rust mock backends (HTTP + HTTPS with self-signed cert).
-- Run `phantom --output jsonl --insecure -- node <script>.js`.
+- Run `phantom run --output jsonl --insecure -- node <script>.js`.
 - Parse JSONL output and assert method, path, status code per trace.
 - Identify traces by `x-phantom-client` custom header in `request_headers`.
 
@@ -209,6 +278,15 @@ Both tests:
 | `tests/proxy_php_ldpreload_integration.rs` | `ldpreload` backend (Linux only): PHP curl HTTP + HTTPS via libc/OpenSSL hooks, zero PHP-specific code — 4 traces |
 
 Both auto-skip if `php` (or its curl extension) is not available. `client.php` (shared by both tests, `tests/apps/php-app/client.php`) is written in PHP 5.3-compatible syntax and takes an optional `PHANTOM_TEST_INSECURE` env var to disable curl peer verification for the ldpreload test, where there is no phantom CA to trust against the mock backend's self-signed cert.
+
+### CLI and MCP Integration Tests
+
+| Test | Description |
+|------|-------------|
+| `tests/cli_query_integration.rs` | `run` propagates the child's exit code; stdout is pure JSONL; `list`/`get`/`search`/`stats`/`clear` filters, `--max-body` truncation flags, store-lock hint |
+| `tests/mcp_stdio_integration.rs` | Speaks raw newline-delimited JSON-RPC to `phantom mcp`: handshake, `tools/list`, a traced curl capture via `start_capture`, `capture_status` polling, `list_traces`/`get_trace`, clean shutdown on stdin EOF |
+
+Both auto-skip their capture parts if `curl` is not in `PATH`.
 
 ### Run a Single Unit Test Function
 
@@ -346,8 +424,16 @@ pub enum StorageError {
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | CLI parsing (`clap` derive), backend/output mode selection, child-process spawning, JSONL output loop |
+| `src/main.rs` | Subcommand dispatch, exit-code mapping, store opening (with lock hint for query commands) |
+| `src/cli.rs` | `clap` derive: `Cli`, `Commands`, per-subcommand arg structs, `GlobalOpts` |
+| `src/runner.rs` | Child-process spawning: proxy env vars, Node/PHP/Java injection assets, `TempScript`, `wait_for_proxy` |
+| `src/commands/run.rs` | `phantom run`: proxy/ldpreload capture wiring, JSONL output loop with exit-status propagation |
+| `src/commands/query.rs` | `phantom list/get/search/stats/clear`, `--since/--until` parsing, table/json/jsonl output |
+| `src/mcp/server.rs` | `PhantomMcp`: rmcp `#[tool_router]` with the 7 MCP tools, `run_mcp` stdio entry |
+| `src/mcp/session.rs` | `CaptureManager`/`CaptureSession`: per-session proxy + child lifecycle + trace pump |
 | `tests/proxy_node_integration.rs` | Integration tests: Node.js proxy capture, alternative HTTP client tracing |
+| `tests/cli_query_integration.rs` | Integration tests: exit codes, JSONL purity, query subcommands, store lock UX |
+| `tests/mcp_stdio_integration.rs` | Integration test: MCP server driven with raw JSON-RPC over stdio |
 | `tests/apps/node-app/proxy-preload.js` | Node.js `--require` preload: patches `http`, `https`, `undici`, `fetch` to go through proxy |
 | `tests/apps/node-app/client.js` | Test client: `http`/`https` module usage (basic integration test) |
 | `tests/apps/node-app/client-alts.js` | Test client: `axios`, `undici`, `globalThis.fetch` (alternative HTTP clients test) |
@@ -355,8 +441,10 @@ pub enum StorageError {
 | `tests/proxy_php_integration.rs` | Integration test: PHP curl HTTP/HTTPS via `proxy` backend (`-d curl.cainfo=` injection) |
 | `tests/proxy_php_ldpreload_integration.rs` | Integration test: PHP curl HTTP/HTTPS via `ldpreload` backend (Linux only) |
 | `tests/apps/php-app/client.php` | Test client: curl extension, PHP 5.3-compatible syntax; shared by both PHP tests |
-| `crates/phantom-core/src/trace.rs` | `HttpTrace`, `TraceId`, `SpanId`, `HttpMethod` |
-| `crates/phantom-core/src/storage.rs` | `TraceStore` trait |
+| `crates/phantom-core/src/trace.rs` | `HttpTrace`, `TraceId`, `SpanId`, `HttpMethod` (incl. `FromStr`/`from_hex`) |
+| `crates/phantom-core/src/query.rs` | `TraceQuery` filter struct + `matches()` predicate, `StatusRange` parsing |
+| `crates/phantom-core/src/view.rs` | `TraceView` agent-facing JSON DTO + `RenderOptions` (truncation, headers-only, redaction) |
+| `crates/phantom-core/src/storage.rs` | `TraceStore` trait (incl. `query`/`clear`) |
 | `crates/phantom-core/src/capture.rs` | `CaptureBackend` trait |
 | `crates/phantom-core/src/error.rs` | `CaptureError`, `StorageError` |
 | `crates/phantom-storage/src/fjall_store.rs` | Storage implementation + all storage tests |
@@ -382,8 +470,14 @@ HTTP traffic
   → app.rs App::add_trace()                   # prepends to traces Vec, bumps count
   → ui.rs render()                            # pure read of App state, no mutation
 
+MCP flow (phantom mcp):
+  → mcp/server.rs PhantomMcp start_capture    # rmcp stdio tool call
+  → mcp/session.rs CaptureManager::start()    # proxy backend + spawn_proxy_child + trace pump task
+  → fjall_store.rs insert() (spawn_blocking)  # same store as CLI/TUI
+  → list_traces / get_trace tools             # TraceQuery → TraceView (bodies truncated by default)
+
 Node.js auto-injection (proxy mode, -- node app.js):
-  → main.rs spawn_proxy_child()               # writes proxy-preload.js to /tmp, prepends --require
+  → runner.rs spawn_proxy_child()             # writes proxy-preload.js to /tmp, prepends --require
   → proxy-preload.js loaded by Node at startup
   → patches http.request, https.request, undici dispatcher, globalThis.fetch
   → all outbound Node requests → phantom MITM proxy

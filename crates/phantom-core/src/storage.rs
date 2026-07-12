@@ -1,4 +1,5 @@
 use crate::error::StorageError;
+use crate::query::TraceQuery;
 use crate::trace::{HttpTrace, SpanId, TraceId};
 
 /// Abstraction over trace storage backends.
@@ -20,4 +21,12 @@ pub trait TraceStore: Send + Sync {
 
     /// Get total trace count.
     fn count(&self) -> Result<u64, StorageError>;
+
+    /// Filtered listing (newest first). See [`TraceQuery`] for filter semantics;
+    /// `query.offset` is applied after filtering, `query.limit` of 0 means
+    /// the implementation's default page size.
+    fn query(&self, query: &TraceQuery) -> Result<Vec<HttpTrace>, StorageError>;
+
+    /// Delete all stored traces and their indices.
+    fn clear(&self) -> Result<(), StorageError>;
 }

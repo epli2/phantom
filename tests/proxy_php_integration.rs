@@ -202,6 +202,7 @@ fn test_proxy_captures_php_curl_traffic() {
     // cert via the injected -d curl.cainfo=<path>, with normal verification.
     let phantom_output = Command::new(phantom_bin)
         .args([
+            "run",
             "--backend",
             "proxy",
             "--output",

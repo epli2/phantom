@@ -290,7 +290,7 @@ run_phantom_capture() {
     # The child process (curl) shares stdout with phantom, so its body output
     # may be interleaved.  We match on "trace_id" which is unique to phantom's
     # output, then extract the JSON object.
-    timeout 10 "$PHANTOM" --backend ldpreload --output jsonl \
+    timeout 10 "$PHANTOM" run --backend ldpreload --output jsonl \
         --agent-lib "$AGENT_LIB" -- $cmd 2>/dev/null \
         | grep -o '{"timestamp_ms".*}$' || true
 }
