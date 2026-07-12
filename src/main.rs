@@ -30,7 +30,7 @@ const JAVA_AGENT_JAR: &[u8] = include_bytes!("../crates/phantom-java-agent/phant
 enum Backend {
     /// MITM proxy — captures HTTP + HTTPS, cross-platform. Node.js HTTPS injected automatically.
     Proxy,
-    /// LD_PRELOAD agent — plain HTTP only, Linux only. No proxy config needed.
+    /// LD_PRELOAD agent — captures HTTP + HTTPS, Linux only. No proxy config needed.
     #[cfg(target_os = "linux")]
     Ldpreload,
 }
@@ -63,17 +63,26 @@ The target application requires NO code changes.\n\
       proxy-preload.js is injected automatically via --require.  Both http://\n\
       and https:// are captured with zero application changes.\n\
 \n\
+    • PHP  (`phantom -- php app.php`)\n\
+      The MITM CA certificate is injected automatically via -d curl.cainfo=.\n\
+      curl-based HTTP and HTTPS (incl. Guzzle's default handler) are captured\n\
+      with zero application changes.  Requires PHP >= 5.3.7 for curl.cainfo;\n\
+      only the curl extension is covered (not PHP streams).\n\
+\n\
     • Other commands  (`phantom -- curl http://api.example.com/v1`)\n\
-      HTTP_PROXY / http_proxy is set automatically.  Plain HTTP is captured.\n\
-      HTTPS requires the application to honour HTTP_PROXY CONNECT tunnelling.\n\
+      HTTP_PROXY / HTTPS_PROXY (and lowercase variants) are set automatically.\n\
+      Plain HTTP is captured; HTTPS is captured if the application honours\n\
+      these env vars for CONNECT tunnelling (as libcurl does by default).\n\
 \n\
     • Manual  (start phantom alone, then configure your app)\n\
       Set HTTP_PROXY=http://127.0.0.1:8080 in the target process yourself.\n\
 \n\
   ldpreload  (Linux only)\n\
     Injects libphantom_agent.so via LD_PRELOAD.  Hooks send/recv/close at\n\
-    the libc level.  No proxy configuration required.  Plain HTTP only\n\
-    (HTTPS traffic is already encrypted at the socket layer).\n\
+    the libc level for plain HTTP, and OpenSSL SSL_write/SSL_read for HTTPS\n\
+    (captured above the TLS layer, before encryption). No proxy config\n\
+    required and no MITM certificate involved — works for any dynamically\n\
+    linked process, language-agnostic (e.g. PHP's curl extension).\n\
 \n\
 ━━━ OUTPUT MODES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
 \n\
@@ -110,6 +119,9 @@ The target application requires NO code changes.\n\
   # Allow self-signed TLS certs on backend servers:\n\
   phantom --insecure --output jsonl -- node app.js\n\
 \n\
+  # Trace a PHP app — curl-based HTTP + HTTPS captured, zero app changes:\n\
+  phantom -- php app.php\n\
+\n\
   # Trace any command (plain HTTP only, HTTPS if app uses HTTP_PROXY CONNECT):\n\
   phantom -- curl http://api.example.com/v1/users\n\
 \n\
@@ -128,7 +140,7 @@ The target application requires NO code changes.\n\
   # Build the agent first:\n\
   cargo build -p phantom-agent\n\
 \n\
-  # Trace a process (plain HTTP only):\n\
+  # Trace a process (HTTP + HTTPS, no MITM certificate needed):\n\
   phantom --backend ldpreload \\\n\
           --agent-lib ./target/debug/libphantom_agent.so \\\n\
           -- curl http://api.example.com/v1/users\n\
@@ -147,7 +159,7 @@ The target application requires NO code changes.\n\
     version
 )]
 struct Cli {
-    /// Capture backend: 'proxy' (MITM, cross-platform) or 'ldpreload' (Linux, plain HTTP only).
+    /// Capture backend: 'proxy' (MITM, cross-platform) or 'ldpreload' (Linux, HTTP + HTTPS).
     #[arg(short, long, value_enum, default_value = "proxy")]
     backend: Backend,
 
@@ -415,20 +427,38 @@ fn is_java_command(exe: &str) -> bool {
     base == "java" || base == "javaw"
 }
 
+/// Returns `true` if `exe` (path or bare name) resolves to `php` or a
+/// version-suffixed PHP binary (e.g. `php7.4`, `php8.2`, `php5.3`).
+fn is_php_command(exe: &str) -> bool {
+    let base = Path::new(exe)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(exe);
+    base == "php"
+        || (base.starts_with("php")
+            && !base[3..].is_empty()
+            && base[3..].chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
 /// Spawns `command` as a child process routed through the phantom proxy.
 ///
-/// * `HTTP_PROXY` / `http_proxy` are set so plain HTTP is captured.
+/// * `HTTP_PROXY` / `HTTPS_PROXY` (and lowercase variants) are set so plain
+///   HTTP and HTTP-client-honoured HTTPS (e.g. libcurl) are captured.
 /// * For Node.js executables the embedded proxy-preload script is written to a
 ///   temp file and prepended as `--require <path>` so HTTPS is also captured
 ///   without touching the application source.
 /// * For Java executables, the phantom-java-agent.jar is injected via -javaagent
 ///   to force proxy settings and bypass SSL verification globally.
+/// * For PHP executables, the MITM CA certificate is written to a temp PEM
+///   file and injected via `-d curl.cainfo=<path>` so the curl extension
+///   trusts phantom's HTTPS interception without any application changes.
 ///
 /// Returns `(child, Option<TempScript>)`.  The `TempScript` must be kept alive
 /// until after the child exits so the file is not deleted prematurely.
 fn spawn_proxy_child(
     command: &[String],
     proxy_port: u16,
+    ca_cert_pem: Option<&str>,
 ) -> anyhow::Result<(std::process::Child, Option<TempScript>)> {
     let exe = &command[0];
     let proxy_url = format!("http://127.0.0.1:{proxy_port}");
@@ -453,10 +483,47 @@ fn spawn_proxy_child(
         actual_args = args;
     }
 
+    if is_php_command(exe)
+        && let Some(pem) = ca_cert_pem
+    {
+        // Write the MITM CA certificate to a temp PEM file.
+        let ca_path = std::env::temp_dir().join(format!("phantom-ca-{}.pem", std::process::id()));
+        std::fs::write(&ca_path, pem)
+            .map_err(|e| anyhow::anyhow!("failed to write CA cert: {e}"))?;
+        temp_script = Some(TempScript(ca_path.clone()));
+
+        // Prepend -d curl.cainfo=<path> before the rest of the args, so
+        // the curl extension trusts phantom's MITM certificate without
+        // any changes to the application's own curl_setopt() calls.
+        let mut args = vec![
+            "-d".to_string(),
+            format!("curl.cainfo={}", ca_path.display()),
+        ];
+        args.extend_from_slice(&actual_args);
+        actual_args = args;
+    }
+
     let mut cmd = std::process::Command::new(exe);
     cmd.args(&actual_args)
         .env("HTTP_PROXY", &proxy_url)
         .env("http_proxy", &proxy_url);
+
+    // Node.js handles HTTPS itself via the injected proxy-preload.js (a
+    // custom ProxyTunnelAgent / undici ProxyAgent). Setting HTTPS_PROXY here
+    // would make libraries like axios configure their own competing
+    // httpsAgent from the env var, conflicting with that injected agent and
+    // breaking HTTPS capture. So HTTPS_PROXY/NO_PROXY are only set for
+    // non-Node commands (e.g. curl, PHP's curl extension), which rely on
+    // libcurl's native env-var proxy detection instead.
+    if !is_node_command(exe) {
+        cmd.env("HTTPS_PROXY", &proxy_url)
+            .env("https_proxy", &proxy_url)
+            // Clear any inherited no-proxy exclusions (e.g. for `localhost`)
+            // so libcurl doesn't bypass phantom's proxy for local targets.
+            // Mirrors the Java branch's explicit `-Dhttp.nonProxyHosts=` below.
+            .env("NO_PROXY", "")
+            .env("no_proxy", "");
+    }
 
     // For Java processes, inject proxy settings and the Java Agent via JAVA_TOOL_OPTIONS.
     if is_java_command(exe) {
@@ -497,7 +564,8 @@ async fn run_proxy(cli: Cli, store: Arc<FjallTraceStore>) -> anyhow::Result<()> 
         if !cli.command.is_empty() {
             // Wait for the proxy to be ready before spawning the child.
             wait_for_proxy(cli.port).await?;
-            let (child, ts) = spawn_proxy_child(&cli.command, cli.port)?;
+            let ca_cert_pem = backend.ca_cert_pem();
+            let (child, ts) = spawn_proxy_child(&cli.command, cli.port, ca_cert_pem.as_deref())?;
             eprintln!(
                 "phantom: spawned PID {} → {}",
                 child.id(),
