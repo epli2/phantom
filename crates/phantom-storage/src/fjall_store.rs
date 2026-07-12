@@ -2,6 +2,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 use phantom_core::error::StorageError;
+use phantom_core::query::TraceQuery;
 use phantom_core::storage::TraceStore;
 use phantom_core::trace::{HttpTrace, SpanId, TraceId};
 
@@ -157,6 +158,72 @@ impl TraceStore for FjallTraceStore {
     fn count(&self) -> Result<u64, StorageError> {
         Ok(self.traces.approximate_len() as u64)
     }
+
+    fn query(&self, query: &TraceQuery) -> Result<Vec<HttpTrace>, StorageError> {
+        const DEFAULT_LIMIT: usize = 100;
+        let limit = if query.limit == 0 {
+            DEFAULT_LIMIT
+        } else {
+            query.limit
+        };
+
+        // With a trace_id filter, the by_trace_id prefix scan is far narrower
+        // than a time scan; otherwise scan by_time (newest first), bounded by
+        // the since/until key range when given.
+        let index_entries: Box<dyn Iterator<Item = fjall::Result<(fjall::Slice, fjall::Slice)>>> =
+            if let Some(trace_id) = &query.trace_id {
+                Box::new(self.by_trace_id.prefix(trace_id.as_bytes()))
+            } else {
+                let start: [u8; 16] = query
+                    .since
+                    .map(|ts| time_key(&ts, &SpanId([0x00; 8])))
+                    .unwrap_or([0x00; 16]);
+                let end: [u8; 16] = query
+                    .until
+                    .map(|ts| time_key(&ts, &SpanId([0xff; 8])))
+                    .unwrap_or([0xff; 16]);
+                Box::new(self.by_time.range(start..=end).rev())
+            };
+
+        let mut skipped = 0;
+        let mut results = Vec::new();
+        for entry in index_entries {
+            if results.len() >= limit {
+                break;
+            }
+            let (_key, value) = entry.map_err(|e| StorageError::Read(e.to_string()))?;
+            let span_id_bytes: [u8; 8] = value[..8]
+                .try_into()
+                .map_err(|_| StorageError::Read("invalid span_id in index".into()))?;
+            if let Some(trace) = self.get_by_span_id(&SpanId(span_id_bytes))?
+                && query.matches(&trace)
+            {
+                if skipped < query.offset {
+                    skipped += 1;
+                    continue;
+                }
+                results.push(trace);
+            }
+        }
+        Ok(results)
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        for partition in [&self.traces, &self.by_time, &self.by_trace_id] {
+            let keys: Vec<_> = partition
+                .keys()
+                .collect::<Result<_, _>>()
+                .map_err(|e| StorageError::Read(e.to_string()))?;
+            let mut batch = self.keyspace.batch();
+            for key in keys {
+                batch.remove(partition, key);
+            }
+            batch
+                .commit()
+                .map_err(|e| StorageError::Write(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -264,5 +331,142 @@ mod tests {
 
         let results = store.search_by_url("/api/", 10).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    use phantom_core::trace::HttpMethod;
+
+    fn make_trace_at(url: &str, status: u16, ts_secs: u64) -> HttpTrace {
+        let mut t = make_trace(url, status);
+        t.timestamp = std::time::UNIX_EPOCH + Duration::from_secs(ts_secs);
+        t
+    }
+
+    #[test]
+    fn test_query_by_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallTraceStore::open(dir.path()).unwrap();
+
+        let mut post = make_trace("http://a/create", 201);
+        post.method = HttpMethod::Post;
+        store.insert(&post).unwrap();
+        store.insert(&make_trace("http://a/read", 200)).unwrap();
+
+        let results = store
+            .query(&TraceQuery {
+                methods: vec![HttpMethod::Post],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "http://a/create");
+    }
+
+    #[test]
+    fn test_query_by_status_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallTraceStore::open(dir.path()).unwrap();
+
+        store.insert(&make_trace("http://a/ok", 200)).unwrap();
+        store.insert(&make_trace("http://a/missing", 404)).unwrap();
+        store.insert(&make_trace("http://a/boom", 500)).unwrap();
+
+        let results = store
+            .query(&TraceQuery {
+                status: Some("4xx".parse().unwrap()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status_code, 404);
+    }
+
+    #[test]
+    fn test_query_time_range_bounds_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallTraceStore::open(dir.path()).unwrap();
+
+        for ts in [100, 200, 300, 400] {
+            store
+                .insert(&make_trace_at(&format!("http://a/{ts}"), 200, ts))
+                .unwrap();
+        }
+
+        // Inclusive on both ends; newest first.
+        let results = store
+            .query(&TraceQuery {
+                since: Some(std::time::UNIX_EPOCH + Duration::from_secs(200)),
+                until: Some(std::time::UNIX_EPOCH + Duration::from_secs(300)),
+                ..Default::default()
+            })
+            .unwrap();
+        let urls: Vec<_> = results.iter().map(|t| t.url.as_str()).collect();
+        assert_eq!(urls, ["http://a/300", "http://a/200"]);
+    }
+
+    #[test]
+    fn test_query_offset_applied_after_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallTraceStore::open(dir.path()).unwrap();
+
+        // Interleave matching (404) and non-matching (200) traces.
+        for i in 0..6u64 {
+            let status = if i % 2 == 0 { 404 } else { 200 };
+            store
+                .insert(&make_trace_at(&format!("http://a/{i}"), status, 100 + i))
+                .unwrap();
+        }
+
+        // Matching, newest first: /4, /2, /0. Offset 1 + limit 1 → /2.
+        let results = store
+            .query(&TraceQuery {
+                status: Some("404".parse().unwrap()),
+                offset: 1,
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "http://a/2");
+    }
+
+    #[test]
+    fn test_query_by_trace_id_with_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallTraceStore::open(dir.path()).unwrap();
+
+        let shared = TraceId(rand_bytes_16());
+        for status in [200, 404] {
+            let mut t = make_trace(&format!("http://a/{status}"), status);
+            t.trace_id = shared.clone();
+            store.insert(&t).unwrap();
+        }
+        store.insert(&make_trace("http://other/404", 404)).unwrap();
+
+        let results = store
+            .query(&TraceQuery {
+                trace_id: Some(shared),
+                status: Some("404".parse().unwrap()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "http://a/404");
+    }
+
+    #[test]
+    fn test_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallTraceStore::open(dir.path()).unwrap();
+
+        let trace = make_trace("http://a/x", 200);
+        let span_id = trace.span_id.clone();
+        store.insert(&trace).unwrap();
+        store.insert(&make_trace("http://a/y", 200)).unwrap();
+
+        store.clear().unwrap();
+
+        assert!(store.get_by_span_id(&span_id).unwrap().is_none());
+        assert!(store.list_recent(10, 0).unwrap().is_empty());
+        assert!(store.query(&TraceQuery::default()).unwrap().is_empty());
     }
 }
