@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod mcp;
 mod runner;
 
 use std::process::ExitCode;
@@ -110,7 +111,9 @@ async fn main() -> anyhow::Result<ExitCode> {
             })
         }
         Commands::Mcp => {
-            anyhow::bail!("the MCP server is not available in this build yet")
+            let store = Arc::new(open_store_for_query(&data_dir)?);
+            mcp::run_mcp(store, data_dir).await?;
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
