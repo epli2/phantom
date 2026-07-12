@@ -98,9 +98,9 @@ impl McpClient {
         self.stdin.flush().unwrap();
     }
 
-    /// Sends a request and reads lines until its response arrives
-    /// (skipping any server-initiated notifications).
-    fn request(&mut self, method: &str, params: Value) -> Value {
+    /// Sends a request and reads lines until its full JSON-RPC response
+    /// arrives (skipping any server-initiated notifications).
+    fn request_raw(&mut self, method: &str, params: Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
@@ -110,14 +110,20 @@ impl McpClient {
             assert!(n > 0, "mcp server closed stdout while awaiting {method}");
             let v: Value = serde_json::from_str(&line).expect("mcp response is JSON");
             if v["id"] == json!(id) {
-                assert!(
-                    v.get("error").is_none(),
-                    "{method} returned error: {}",
-                    v["error"]
-                );
-                return v["result"].clone();
+                return v;
             }
         }
+    }
+
+    /// Like `request_raw`, but asserts success and returns only the result.
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let v = self.request_raw(method, params);
+        assert!(
+            v.get("error").is_none(),
+            "{method} returned error: {}",
+            v["error"]
+        );
+        v["result"].clone()
     }
 
     /// Calls an MCP tool and returns the parsed JSON content of its result.
@@ -135,6 +141,26 @@ impl McpClient {
         } else {
             content["json"].clone()
         }
+    }
+
+    /// Calls a tool that is expected to fail; returns the error message.
+    /// Tool failures may surface as a JSON-RPC error or as a CallToolResult
+    /// with isError: true, depending on the failure layer.
+    fn call_tool_expect_error(&mut self, name: &str, arguments: Value) -> String {
+        let v = self.request_raw("tools/call", json!({"name": name, "arguments": arguments}));
+        if let Some(err) = v.get("error") {
+            return err["message"].as_str().unwrap_or_default().to_string();
+        }
+        let result = &v["result"];
+        assert_eq!(
+            result["isError"],
+            json!(true),
+            "tool {name} unexpectedly succeeded: {result}"
+        );
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn initialize(&mut self) {
@@ -294,5 +320,157 @@ fn test_mcp_stdio_round_trip() {
     let listed = client.call_tool("list_traces", json!({}));
     assert!(listed["traces"].as_array().unwrap().is_empty());
 
+    client.shutdown();
+}
+
+#[test]
+fn test_mcp_tool_error_paths() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let mut client = McpClient::start(tmp_dir.path());
+
+    // Unknown / malformed span IDs.
+    let msg = client.call_tool_expect_error("get_trace", json!({"span_id": "ffffffffffffffff"}));
+    assert!(msg.contains("no trace found"), "unexpected message: {msg}");
+    let msg = client.call_tool_expect_error("get_trace", json!({"span_id": "not-hex"}));
+    assert!(msg.contains("invalid span_id"), "unexpected message: {msg}");
+
+    // Unknown session IDs.
+    let msg = client.call_tool_expect_error("stop_capture", json!({"session_id": "deadbeef"}));
+    assert!(msg.contains("unknown session"), "unexpected message: {msg}");
+    let msg = client.call_tool_expect_error("capture_status", json!({"session_id": "deadbeef"}));
+    assert!(msg.contains("unknown session"), "unexpected message: {msg}");
+
+    // Malformed filters.
+    let msg = client.call_tool_expect_error("list_traces", json!({"method": ["FETCH"]}));
+    assert!(
+        msg.contains("unknown HTTP method"),
+        "unexpected message: {msg}"
+    );
+    let msg = client.call_tool_expect_error("list_traces", json!({"status": "bogus"}));
+    assert!(
+        msg.contains("invalid status range"),
+        "unexpected message: {msg}"
+    );
+    let msg = client.call_tool_expect_error("list_traces", json!({"trace_id": "xyz"}));
+    assert!(
+        msg.contains("invalid trace_id"),
+        "unexpected message: {msg}"
+    );
+
+    // clear_traces without confirmation refuses and deletes nothing.
+    let msg = client.call_tool_expect_error("clear_traces", json!({"confirm": false}));
+    assert!(msg.contains("confirm"), "unexpected message: {msg}");
+
+    client.shutdown();
+}
+
+#[test]
+fn test_mcp_proxy_only_session() {
+    if curl_missing() {
+        eprintln!("SKIP: `curl` not found");
+        return;
+    }
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let mut client = McpClient::start(tmp_dir.path());
+    let backend_port = start_http_backend();
+
+    // No command: phantom starts the proxy and reports proxy_only state.
+    let started = client.call_tool("start_capture", json!({}));
+    assert_eq!(started["state"], "proxy_only");
+    assert_eq!(started["pid"], Value::Null);
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+    let proxy_url = started["proxy_url"].as_str().unwrap().to_string();
+
+    // A client configured with the returned proxy_url is captured.
+    // no_proxy must be cleared so curl routes 127.0.0.1 through the proxy.
+    let status = Command::new("curl")
+        .args(["--silent", "--output", "/dev/null", "--proxy", &proxy_url])
+        .arg(format!("http://127.0.0.1:{backend_port}/api/health"))
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .status()
+        .expect("curl through proxy");
+    assert!(status.success(), "curl through the proxy failed");
+
+    // The trace shows up without any child process involved.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = client.call_tool("capture_status", json!({"session_id": session_id}));
+        if status["sessions"][0]["trace_count"].as_u64() == Some(1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "trace was not captured: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let stopped = client.call_tool("stop_capture", json!({"session_id": session_id}));
+    assert_eq!(stopped["state"], "proxy_only");
+    assert_eq!(stopped["trace_count"], 1);
+
+    client.shutdown();
+}
+
+#[test]
+fn test_mcp_redacts_sensitive_headers_by_default() {
+    if curl_missing() {
+        eprintln!("SKIP: `curl` not found");
+        return;
+    }
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let mut client = McpClient::start(tmp_dir.path());
+    let backend_port = start_http_backend();
+
+    let started = client.call_tool(
+        "start_capture",
+        json!({
+            "command": [
+                "sh", "-c",
+                format!(
+                    "curl --silent --output /dev/null --proxy \"$HTTP_PROXY\" \
+                     -H 'Authorization: Bearer sekrit-token' \
+                     http://127.0.0.1:{backend_port}/api/health"
+                )
+            ]
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = client.call_tool("capture_status", json!({"session_id": session_id}));
+        let session = &status["sessions"][0];
+        if session["state"] == "exited" && session["trace_count"].as_u64() == Some(1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture did not finish: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Default: the authorization value never reaches the agent.
+    let listed = client.call_tool("list_traces", json!({}));
+    let headers = &listed["traces"][0]["request_headers"];
+    assert_eq!(headers["authorization"], "[redacted]");
+
+    // Same for get_trace.
+    let span_id = listed["traces"][0]["span_id"].as_str().unwrap().to_string();
+    let trace = client.call_tool("get_trace", json!({"span_id": span_id}));
+    assert_eq!(trace["request_headers"]["authorization"], "[redacted]");
+
+    // Explicit opt-out reveals the raw value.
+    let listed = client.call_tool("list_traces", json!({"redact_sensitive_headers": false}));
+    assert_eq!(
+        listed["traces"][0]["request_headers"]["authorization"],
+        "Bearer sekrit-token"
+    );
+
+    client.call_tool("stop_capture", json!({"session_id": session_id}));
     client.shutdown();
 }

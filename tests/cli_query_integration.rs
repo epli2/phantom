@@ -81,9 +81,9 @@ fn curl_missing() -> bool {
         .is_err()
 }
 
-/// Run `phantom run -o jsonl` tracing one curl GET against the mock backend,
-/// persisting traces into `data_dir`. Returns phantom's stdout.
-fn capture_one_health_request(data_dir: &Path) -> String {
+/// Run `phantom run -o jsonl <extra_run_flags>` tracing one curl GET against
+/// the mock backend, persisting traces into `data_dir`.
+fn capture_health_request(data_dir: &Path, extra_run_flags: &[&str]) -> std::process::Output {
     let phantom_bin = env!("CARGO_BIN_EXE_phantom");
     let backend_port = available_port();
     let proxy_port = available_port();
@@ -99,6 +99,7 @@ fn capture_one_health_request(data_dir: &Path) -> String {
         .arg(proxy_port.to_string())
         .arg("--data-dir")
         .arg(data_dir)
+        .args(extra_run_flags)
         .env("no_proxy", "")
         .env("NO_PROXY", "")
         .arg("--")
@@ -112,6 +113,13 @@ fn capture_one_health_request(data_dir: &Path) -> String {
         "phantom run failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    out
+}
+
+/// Run `phantom run -o jsonl` tracing one curl GET against the mock backend,
+/// persisting traces into `data_dir`. Returns phantom's stdout.
+fn capture_one_health_request(data_dir: &Path) -> String {
+    let out = capture_health_request(data_dir, &[]);
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -168,6 +176,50 @@ fn test_run_success_exit_code_zero() {
         .output()
         .expect("run phantom");
     assert_eq!(out.status.code(), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_run_signal_death_maps_to_128_plus_signal() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_phantom"))
+        .args(["run", "--output", "jsonl", "--port"])
+        .arg(available_port().to_string())
+        .arg("--data-dir")
+        .arg(tmp_dir.path())
+        .args(["--", "sh", "-c", "kill -9 $$"])
+        .output()
+        .expect("run phantom");
+    assert_eq!(
+        out.status.code(),
+        Some(128 + 9),
+        "SIGKILLed child should map to exit 137; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn test_run_quiet_suppresses_status_and_summary() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_phantom"))
+        .args(["--quiet", "run", "--output", "jsonl", "--port"])
+        .arg(available_port().to_string())
+        .arg("--data-dir")
+        .arg(tmp_dir.path())
+        .args(["--", "sh", "-c", "exit 5"])
+        .output()
+        .expect("run phantom");
+    // Exit code still propagates in quiet mode.
+    assert_eq!(out.status.code(), Some(5));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("phantom:"),
+        "status lines must be suppressed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("\"event\""),
+        "exit summary must be suppressed: {stderr}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -267,6 +319,139 @@ fn test_capture_then_query_via_cli() {
     assert!(out.status.success());
     let out = phantom_query(tmp_dir.path(), &["list"]);
     assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn test_run_stream_respects_max_body_and_reports_summary() {
+    if curl_missing() {
+        eprintln!("SKIP: `curl` not found");
+        return;
+    }
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out = capture_health_request(tmp_dir.path(), &["--max-body", "4"]);
+
+    // Live JSONL stream honours --max-body and flags the truncation.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.lines().next().expect("one trace"))
+        .expect("trace line is JSON");
+    assert_eq!(v["response_body"].as_str().unwrap().len(), 4);
+    assert_eq!(v["response_body_truncated"], true);
+    assert_eq!(
+        v["response_body_bytes"].as_u64().unwrap(),
+        HEALTH_BODY.len() as u64
+    );
+
+    // The stderr exit summary counts the captured traces.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let summary = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["event"] == "exit")
+        .expect("exit summary on stderr");
+    assert_eq!(summary["traces_captured"], 1);
+    assert_eq!(summary["child_exit_code"], 0);
+}
+
+#[test]
+fn test_run_stream_headers_only() {
+    if curl_missing() {
+        eprintln!("SKIP: `curl` not found");
+        return;
+    }
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out = capture_health_request(tmp_dir.path(), &["--headers-only"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("one trace")).unwrap();
+    assert!(v.get("response_body").is_none());
+    assert_eq!(
+        v["response_body_bytes"].as_u64().unwrap(),
+        HEALTH_BODY.len() as u64
+    );
+    // The full body is still persisted — only the stream output is reduced.
+    let listed = phantom_query(tmp_dir.path(), &["list"]);
+    let stored: serde_json::Value = serde_json::from_str(
+        String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored["response_body"].as_str().unwrap(), HEALTH_BODY);
+}
+
+#[test]
+fn test_list_filters_method_time_and_trace_id() {
+    if curl_missing() {
+        eprintln!("SKIP: `curl` not found");
+        return;
+    }
+
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let stdout = capture_one_health_request(tmp_dir.path());
+    let captured: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("one trace")).unwrap();
+    let trace_id = captured["trace_id"].as_str().unwrap();
+
+    // --method: GET matches, POST does not.
+    let out = phantom_query(tmp_dir.path(), &["list", "--method", "GET"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 1);
+    let out = phantom_query(tmp_dir.path(), &["list", "--method", "POST"]);
+    assert!(out.stdout.is_empty());
+
+    // --since/--until with relative times: the trace is inside (1h ago, now]
+    // and outside windows entirely in the past.
+    let out = phantom_query(tmp_dir.path(), &["list", "--since", "1h"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 1);
+    let out = phantom_query(tmp_dir.path(), &["list", "--until", "1h"]);
+    assert!(out.stdout.is_empty());
+
+    // --trace-id round trip.
+    let out = phantom_query(tmp_dir.path(), &["list", "--trace-id", trace_id]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 1);
+    let other_id = "0".repeat(32);
+    let out = phantom_query(tmp_dir.path(), &["list", "--trace-id", &other_id]);
+    assert!(out.stdout.is_empty());
+
+    // --format json produces a pretty-printed array.
+    let out = phantom_query(tmp_dir.path(), &["list", "--format", "json"]);
+    let arr: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json array");
+    assert_eq!(arr.as_array().unwrap().len(), 1);
+
+    // --redact-header masks the named header in output.
+    let out = phantom_query(tmp_dir.path(), &["list", "--redact-header", "User-Agent"]);
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).lines().next().unwrap()).unwrap();
+    assert_eq!(v["request_headers"]["user-agent"], "[redacted]");
+}
+
+#[test]
+fn test_query_invalid_arguments_fail_fast() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+
+    // clap rejects an unparsable status range before touching the store.
+    let out = phantom_query(tmp_dir.path(), &["list", "--status", "bogus"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid status range"),
+        "stderr should explain the status parse failure"
+    );
+
+    // Non-hex span/trace IDs are rejected with a clear message and exit 1.
+    let out = phantom_query(tmp_dir.path(), &["get", "not-a-span-id"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid span ID"));
+
+    let out = phantom_query(tmp_dir.path(), &["list", "--trace-id", "xyz"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid trace ID"));
+
+    // Unparsable --since values are rejected.
+    let out = phantom_query(tmp_dir.path(), &["list", "--since", "yesterday"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid time"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

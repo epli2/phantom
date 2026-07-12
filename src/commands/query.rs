@@ -152,3 +152,78 @@ pub fn clear(store: &dyn TraceStore, yes: bool, quiet: bool) -> anyhow::Result<b
     }
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn test_parse_time_rfc3339() {
+        let t = parse_time("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(t, UNIX_EPOCH + Duration::from_secs(1_767_225_600));
+    }
+
+    #[test]
+    fn test_parse_time_relative_means_ago() {
+        let before = SystemTime::now();
+        let t = parse_time("10m").unwrap();
+        let ago = before.duration_since(t).unwrap();
+        // Within a small tolerance of exactly 10 minutes before "now".
+        assert!(
+            ago >= Duration::from_secs(599) && ago <= Duration::from_secs(601),
+            "expected ~600s ago, got {ago:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_time_relative_units() {
+        for (input, secs) in [("30s", 30), ("2h", 7200), ("1d", 86400)] {
+            let t = parse_time(input).unwrap();
+            let ago = SystemTime::now().duration_since(t).unwrap().as_secs();
+            assert!(
+                ago.abs_diff(secs) <= 1,
+                "{input}: expected ~{secs}s ago, got {ago}s"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_time_rejects_garbage() {
+        for input in ["", "yesterday", "2026-13-01T00:00:00Z", "10 parsecs"] {
+            assert!(parse_time(input).is_err(), "{input:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn test_build_query_rejects_bad_trace_id() {
+        let filter = FilterArgs {
+            methods: Vec::new(),
+            status: None,
+            since: None,
+            until: None,
+            trace_id: Some("not-hex".to_string()),
+            limit: 50,
+            offset: 0,
+            format: QueryFormat::Jsonl,
+            max_body: 0,
+            headers_only: false,
+            redact_headers: Vec::new(),
+        };
+        let err = build_query(None, &filter).unwrap_err();
+        assert!(err.to_string().contains("invalid trace ID"));
+    }
+
+    #[test]
+    fn test_render_options_zero_max_body_means_unlimited() {
+        assert_eq!(render_options(0, false, &[]).max_body, None);
+        assert_eq!(render_options(16, false, &[]).max_body, Some(16));
+    }
+
+    #[test]
+    fn test_render_options_lowercases_redact_headers() {
+        let opts = render_options(0, false, &["X-Api-Key".to_string()]);
+        assert_eq!(opts.redact_headers, ["x-api-key"]);
+    }
+}

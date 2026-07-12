@@ -257,6 +257,43 @@ mod tests {
     }
 
     #[test]
+    fn test_render_no_truncation_when_body_fits() {
+        let t = make_trace(Some(b"1234".to_vec()), None);
+        let opts = RenderOptions {
+            max_body: Some(4),
+            ..Default::default()
+        };
+        let v = TraceView::render(&t, &opts);
+        assert_eq!(v.request_body.as_deref(), Some("1234"));
+        assert!(!v.request_body_truncated);
+        assert_eq!(v.request_body_bytes, Some(4));
+    }
+
+    #[test]
+    fn test_render_max_body_zero_empties_body() {
+        let t = make_trace(Some(b"data".to_vec()), None);
+        let opts = RenderOptions {
+            max_body: Some(0),
+            ..Default::default()
+        };
+        let v = TraceView::render(&t, &opts);
+        assert_eq!(v.request_body.as_deref(), Some(""));
+        assert!(v.request_body_truncated);
+        assert_eq!(v.request_body_bytes, Some(4));
+    }
+
+    #[test]
+    fn test_render_lossy_decodes_invalid_utf8() {
+        let t = make_trace(Some(vec![0x68, 0x69, 0xff, 0xfe]), None);
+        let v = TraceView::render(&t, &RenderOptions::default());
+        let body = v.request_body.unwrap();
+        assert!(body.starts_with("hi"));
+        assert!(body.contains('\u{fffd}'));
+        // Size reports the original bytes, not the decoded string length.
+        assert_eq!(v.request_body_bytes, Some(4));
+    }
+
+    #[test]
     fn test_render_redacts_headers() {
         let t = make_trace(None, None);
         let opts = RenderOptions {
@@ -266,6 +303,33 @@ mod tests {
         let v = TraceView::render(&t, &opts);
         assert_eq!(v.request_headers["authorization"], "[redacted]");
         assert_eq!(v.request_headers["accept"], "application/json");
+    }
+
+    #[test]
+    fn test_render_redaction_is_case_insensitive() {
+        let mut t = make_trace(None, None);
+        t.response_headers
+            .insert("Set-Cookie".to_string(), "sid=1".to_string());
+        let opts = RenderOptions {
+            redact_headers: vec!["AUTHORIZATION".to_string(), "set-cookie".to_string()],
+            ..Default::default()
+        };
+        let v = TraceView::render(&t, &opts);
+        assert_eq!(v.request_headers["authorization"], "[redacted]");
+        assert_eq!(v.response_headers["Set-Cookie"], "[redacted]");
+    }
+
+    #[test]
+    fn test_sensitive_headers_cover_credential_carriers() {
+        let list = RenderOptions::sensitive_headers();
+        for h in [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+        ] {
+            assert!(list.contains(&h.to_string()), "missing {h}");
+        }
     }
 
     #[test]

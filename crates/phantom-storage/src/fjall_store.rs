@@ -425,6 +425,63 @@ mod tests {
     }
 
     #[test]
+    fn test_query_open_ended_time_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallTraceStore::open(dir.path()).unwrap();
+
+        for ts in [100, 200, 300] {
+            store
+                .insert(&make_trace_at(&format!("http://a/{ts}"), 200, ts))
+                .unwrap();
+        }
+
+        // since only
+        let results = store
+            .query(&TraceQuery {
+                since: Some(std::time::UNIX_EPOCH + Duration::from_secs(200)),
+                ..Default::default()
+            })
+            .unwrap();
+        let urls: Vec<_> = results.iter().map(|t| t.url.as_str()).collect();
+        assert_eq!(urls, ["http://a/300", "http://a/200"]);
+
+        // until only
+        let results = store
+            .query(&TraceQuery {
+                until: Some(std::time::UNIX_EPOCH + Duration::from_secs(200)),
+                ..Default::default()
+            })
+            .unwrap();
+        let urls: Vec<_> = results.iter().map(|t| t.url.as_str()).collect();
+        assert_eq!(urls, ["http://a/200", "http://a/100"]);
+    }
+
+    #[test]
+    fn test_query_zero_limit_uses_default_of_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallTraceStore::open(dir.path()).unwrap();
+
+        for i in 0..120u64 {
+            store
+                .insert(&make_trace_at(&format!("http://a/{i}"), 200, 1000 + i))
+                .unwrap();
+        }
+
+        let results = store.query(&TraceQuery::default()).unwrap();
+        assert_eq!(results.len(), 100);
+        // Newest first: the default page starts at the most recent trace.
+        assert_eq!(results[0].url, "http://a/119");
+
+        let results = store
+            .query(&TraceQuery {
+                limit: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 5);
+    }
+
+    #[test]
     fn test_query_offset_applied_after_filter() {
         let dir = tempfile::tempdir().unwrap();
         let store = FjallTraceStore::open(dir.path()).unwrap();
