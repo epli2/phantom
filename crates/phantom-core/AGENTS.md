@@ -8,9 +8,11 @@
 
 ```
 crates/phantom-core/src/
-├── lib.rs        # Re-exports: pub mod trace, capture, storage, error
-├── trace.rs      # HttpTrace, TraceId, SpanId, HttpMethod
-├── storage.rs    # TraceStore trait
+├── lib.rs        # Re-exports: pub mod trace, capture, storage, error, query, view
+├── trace.rs      # HttpTrace, TraceId, SpanId, HttpMethod (FromStr / from_hex parsers)
+├── storage.rs    # TraceStore trait (incl. query/clear)
+├── query.rs      # TraceQuery filter struct + matches() predicate, StatusRange
+├── view.rs       # TraceView agent-facing JSON DTO + RenderOptions
 ├── capture.rs    # CaptureBackend trait
 └── error.rs      # CaptureError, StorageError (thiserror)
 ```
@@ -23,6 +25,8 @@ crates/phantom-core/src/
 |------|------|-------|
 | Add/change HTTP trace fields | `trace.rs` | HttpTrace struct |
 | Add storage query method | `storage.rs` | TraceStore trait |
+| Add trace filter field | `query.rs` | TraceQuery + matches() |
+| Change agent-facing JSON shape | `view.rs` | TraceView::render (shared by JSONL/CLI/MCP) |
 | Add capture mode | `capture.rs` | CaptureBackend trait |
 | Add error variant | `error.rs` | Two enums: CaptureError, StorageError |
 
