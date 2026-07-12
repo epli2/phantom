@@ -228,6 +228,7 @@ fn test_proxy_captures_java_http_clients() {
     // so the Java app needs zero proxy configuration of its own.
     let phantom_output = Command::new(phantom_bin)
         .args([
+            "run",
             "--backend",
             "proxy",
             "--output",

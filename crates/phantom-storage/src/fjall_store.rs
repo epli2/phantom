@@ -11,10 +11,30 @@ pub struct FjallTraceStore {
     traces: PartitionHandle,
     by_time: PartitionHandle,
     by_trace_id: PartitionHandle,
+    /// Advisory exclusive lock on the data directory, released on drop.
+    /// fjall itself does not lock across processes, and two writers on one
+    /// keyspace would corrupt it — so we enforce single-process access here.
+    _lock: std::fs::File,
 }
 
 impl FjallTraceStore {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path).map_err(|e| StorageError::Open(e.to_string()))?;
+        let lock_path = path.join("phantom.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| StorageError::Open(format!("{}: {e}", lock_path.display())))?;
+        lock.try_lock().map_err(|_| {
+            StorageError::Open(format!(
+                "data dir {} holds an active store lock (another phantom process is using it)",
+                path.display()
+            ))
+        })?;
+
         let keyspace = Config::new(path)
             .open()
             .map_err(|e| StorageError::Open(e.to_string()))?;
@@ -39,6 +59,7 @@ impl FjallTraceStore {
             traces,
             by_time,
             by_trace_id,
+            _lock: lock,
         })
     }
 }
@@ -451,6 +472,19 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].url, "http://a/404");
+    }
+
+    #[test]
+    fn test_open_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallTraceStore::open(dir.path()).unwrap();
+
+        let second = FjallTraceStore::open(dir.path());
+        assert!(matches!(second, Err(StorageError::Open(_))));
+
+        // Lock is released when the store is dropped.
+        drop(store);
+        assert!(FjallTraceStore::open(dir.path()).is_ok());
     }
 
     #[test]
