@@ -24,11 +24,14 @@ tests/
   proxy_node_integration.rs           # Integration tests: Node.js proxy capture (HTTP + HTTPS)
   proxy_php_integration.rs            # Integration test: PHP curl via proxy backend (HTTP + HTTPS)
   proxy_php_ldpreload_integration.rs  # Integration test: PHP curl via ldpreload backend (Linux only)
+  proxy_bind_integration.rs           # Integration test: --bind 0.0.0.0 + ca.pem export (Docker sidecar mode)
   cli_query_integration.rs            # Integration tests: exit-code propagation, JSONL purity, list/get/clear, store lock UX
   mcp_stdio_integration.rs            # Integration test: MCP server via raw JSON-RPC over stdio
   apps/node-app/             # Test Node.js app (client.js, client-alts.js, proxy-preload.js)
   apps/php-app/              # Test PHP app (client.php, curl extension, PHP 5.3-compatible)
   integration/               # Shell-based integration tests
+examples/
+  docker-sidecar/            # phantom as a Docker Compose sidecar tracing a peer container
 Cargo.toml                   # Workspace root + binary crate
 plan.md                      # Japanese-language technical design document
 ```
@@ -97,6 +100,7 @@ make check    # fmt + clippy + build + test (full CI locally)
 | `-b, --backend <BACKEND>` | `proxy` | `proxy` (MITM, cross-platform) or `ldpreload` (Linux only, HTTP + HTTPS) |
 | `-o, --output <OUTPUT>` | `tui` | `tui` (interactive) or `jsonl` (stdout stream; exits with the child's exit code) |
 | `-p, --port <PORT>` | `8080` | Proxy capture port |
+| `--bind <ADDR>` | `127.0.0.1` | IP address the proxy binds to. `0.0.0.0` exposes it to other hosts/containers (Docker sidecar mode) — no auth, trusted networks only |
 | `--insecure` | off | Disable TLS verification for backend servers (self-signed certs) |
 | `--agent-lib <PATH>` | — | Path to `libphantom_agent.so` (ldpreload backend) |
 | `--fault <SPEC>` | — | Fault injection rules (repeatable) |
@@ -158,6 +162,19 @@ Unlike Node.js, PHP requires **no injected script**: libcurl (the library backin
 - `curl.cainfo` requires **PHP ≥ 5.3.7** (added in that release). On PHP 5.3.0–5.3.6, HTTP capture still works (via `HTTP_PROXY`/`HTTPS_PROXY`) but HTTPS capture fails TLS verification unless the application itself disables it.
 - If the application explicitly sets `CURLOPT_CAINFO` or `CURLOPT_SSL_VERIFYPEER`, phantom's injected `curl.cainfo` default is overridden and HTTPS capture may fail with a TLS error — the same class of limitation as Node's double-proxy guard.
 - `--backend ldpreload` (Linux only) requires **no PHP-specific code at all**: it hooks libc `send`/`recv` and OpenSSL `SSL_write`/`SSL_read` at a language-agnostic level, so it captures PHP's curl-based HTTP and HTTPS traffic (no MITM cert involved) exactly like it does for any other dynamically-linked process. See `tests/proxy_php_ldpreload_integration.rs`. This depends on the target's curl/OpenSSL actually calling those exact libc/OpenSSL symbols — some PHP builds bundle or `dlopen(RTLD_DEEPBIND)` their own libcurl/libssl, which shields them from `LD_PRELOAD` interposition; the integration test treats "child succeeded, zero traces captured" as an environment-support gap (skip) rather than a failure, since it's a property of the specific PHP build, not of phantom's PHP support code.
+
+---
+
+## Docker Sidecar Mode (`--bind`)
+
+phantom can trace an arbitrary web app already running in its own Docker container, without spawning or managing it — run phantom as a **sidecar container** on the same Docker network, and configure the target container's `HTTP_PROXY`/`HTTPS_PROXY` to point at it. This is the same "manual" proxy-configuration mode phantom always supported on a single host (`HTTP_PROXY=http://127.0.0.1:8080 your-app`), extended across a Docker network boundary via `--bind`.
+
+- `--bind 0.0.0.0` makes the proxy reachable from other containers (default is `127.0.0.1`, unreachable from outside the container). **No authentication** — only bind `0.0.0.0` on a trusted/private network.
+- The MITM CA certificate is written to **`<data_dir>/ca.pem` on every `phantom run`** (not just when phantom spawns a PHP child) — as soon as the proxy is confirmed listening, regardless of whether a `-- <CMD>` is given. Bind-mount `<data_dir>` into the target container to make the CA available there for HTTPS trust. It is regenerated fresh every run, so sharing one `--data-dir` across concurrent phantom processes will race on `ca.pem` — use one data dir per phantom instance.
+- CA trust is client/language-specific (there is no universal env var): curl uses `CURLOPT_CAINFO`/`--cacert`, Node.js uses `NODE_EXTRA_CA_CERTS`, PHP's curl extension uses `-d curl.cainfo=` (same mechanism as automatic PHP child injection above), the JVM needs a truststore import, Python `requests` uses `REQUESTS_CA_BUNDLE`, and Debian/Ubuntu-based images can use `update-ca-certificates`.
+- See `examples/docker-sidecar/` for a runnable `compose.yaml` + walkthrough (not verified end-to-end in the environment it was authored in — no Docker daemon was available there; confirm it in your own environment).
+- Out of scope: transparent traffic interception (iptables/eBPF, requiring no target container changes) and tracing across container boundaries via the `ldpreload` backend. Possible future work.
+- `phantom mcp` sessions always bind loopback only (no `--bind` there) — Docker sidecar mode applies to `phantom run`.
 
 ---
 
@@ -249,6 +266,9 @@ cargo test --test proxy_php_integration -- --nocapture
 cargo build -p phantom-agent
 cargo test --test proxy_php_ldpreload_integration -- --nocapture
 
+# --bind 0.0.0.0 + ca.pem export test (Docker sidecar mode; requires curl)
+cargo test --test proxy_bind_integration -- --nocapture
+
 # CLI query / exit-code / lock UX integration tests (requires curl for the capture parts)
 cargo test --test cli_query_integration -- --nocapture
 
@@ -278,6 +298,10 @@ Both tests:
 | `tests/proxy_php_ldpreload_integration.rs` | `ldpreload` backend (Linux only): PHP curl HTTP + HTTPS via libc/OpenSSL hooks, zero PHP-specific code — 4 traces |
 
 Both auto-skip if `php` (or its curl extension) is not available. `client.php` (shared by both tests, `tests/apps/php-app/client.php`) is written in PHP 5.3-compatible syntax and takes an optional `PHANTOM_TEST_INSECURE` env var to disable curl peer verification for the ldpreload test, where there is no phantom CA to trust against the mock backend's self-signed cert.
+
+### Docker Sidecar Test (`tests/proxy_bind_integration.rs`)
+
+Verifies `--bind 0.0.0.0` still proxies correctly (reachable via loopback, since an unspecified bind always includes it) and that `<data_dir>/ca.pem` is written once the proxy is ready. Drives `phantom run ... -- curl ...` rather than a truly standalone/no-child invocation, since JSONL mode only auto-exits on child completion or ctrl-c — the CA-export code path runs unconditionally before the child-spawn branch either way, so this still fully exercises what a Docker sidecar run would do. The fully standalone case is verified manually via `examples/docker-sidecar/`.
 
 ### CLI and MCP Integration Tests
 
@@ -426,7 +450,7 @@ pub enum StorageError {
 |---|---|
 | `src/main.rs` | Subcommand dispatch, exit-code mapping, store opening (with lock hint for query commands) |
 | `src/cli.rs` | `clap` derive: `Cli`, `Commands`, per-subcommand arg structs, `GlobalOpts` |
-| `src/runner.rs` | Child-process spawning: proxy env vars, Node/PHP/Java injection assets, `TempScript`, `wait_for_proxy` |
+| `src/runner.rs` | Child-process spawning: proxy env vars, Node/PHP/Java injection assets, `TempScript`, `wait_for_proxy`, `loopback_safe` (bind-address resolution) |
 | `src/commands/run.rs` | `phantom run`: proxy/ldpreload capture wiring, JSONL output loop with exit-status propagation |
 | `src/commands/query.rs` | `phantom list/get/search/stats/clear`, `--since/--until` parsing, table/json/jsonl output |
 | `src/mcp/server.rs` | `PhantomMcp`: rmcp `#[tool_router]` with the 7 MCP tools, `run_mcp` stdio entry |
@@ -441,6 +465,9 @@ pub enum StorageError {
 | `tests/proxy_php_integration.rs` | Integration test: PHP curl HTTP/HTTPS via `proxy` backend (`-d curl.cainfo=` injection) |
 | `tests/proxy_php_ldpreload_integration.rs` | Integration test: PHP curl HTTP/HTTPS via `ldpreload` backend (Linux only) |
 | `tests/apps/php-app/client.php` | Test client: curl extension, PHP 5.3-compatible syntax; shared by both PHP tests |
+| `tests/proxy_bind_integration.rs` | Integration test: `--bind 0.0.0.0` and `<data_dir>/ca.pem` export (Docker sidecar mode) |
+| `examples/docker-sidecar/compose.yaml` | Example: phantom as a Docker Compose sidecar tracing a peer `app` container via HTTP_PROXY |
+| `examples/docker-sidecar/README.md` | Walkthrough: sidecar pattern, `--bind` security note, per-client CA trust table |
 | `crates/phantom-core/src/trace.rs` | `HttpTrace`, `TraceId`, `SpanId`, `HttpMethod` (incl. `FromStr`/`from_hex`) |
 | `crates/phantom-core/src/query.rs` | `TraceQuery` filter struct + `matches()` predicate, `StatusRange` parsing |
 | `crates/phantom-core/src/view.rs` | `TraceView` agent-facing JSON DTO + `RenderOptions` (truncation, headers-only, redaction) |
@@ -448,7 +475,7 @@ pub enum StorageError {
 | `crates/phantom-core/src/capture.rs` | `CaptureBackend` trait |
 | `crates/phantom-core/src/error.rs` | `CaptureError`, `StorageError` |
 | `crates/phantom-storage/src/fjall_store.rs` | Storage implementation + all storage tests |
-| `crates/phantom-capture/src/proxy.rs` | MITM proxy implementation (cross-platform); also exposes `ca_cert_pem()` for PHP `curl.cainfo` injection |
+| `crates/phantom-capture/src/proxy.rs` | MITM proxy implementation (cross-platform); `bind_ip` field controls listen address; also exposes `ca_cert_pem()` for PHP `curl.cainfo` injection and Docker sidecar CA export |
 | `crates/phantom-capture/src/ldpreload.rs` | LD_PRELOAD capture backend (Linux only) |
 | `crates/phantom-agent/src/lib.rs` | LD_PRELOAD dylib: hooks libc `send`/`recv`/`close` and OpenSSL `SSL_write`/`SSL_read` (HTTPS) |
 | `crates/phantom-tui/src/app.rs` | TUI state (`App`) and all state mutation |

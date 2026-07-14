@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -125,6 +126,11 @@ pub enum Commands {
 \n\
     • Manual  (start phantom alone, then configure your app)\n\
       Set HTTP_PROXY=http://127.0.0.1:8080 in the target process yourself.\n\
+      Same pattern works across a Docker network: run phantom as a sidecar\n\
+      container with --bind 0.0.0.0, point the target container's\n\
+      HTTP_PROXY/HTTPS_PROXY at it (e.g. http://phantom:8080), and trust\n\
+      the MITM CA written to <data-dir>/ca.pem for HTTPS. See\n\
+      examples/docker-sidecar/.\n\
 \n\
   ldpreload  (Linux only)\n\
     Injects libphantom_agent.so via LD_PRELOAD.  Hooks send/recv/close at\n\
@@ -178,7 +184,14 @@ pub enum Commands {
   cargo build -p phantom-agent\n\
   phantom run --backend ldpreload \\\n\
           --agent-lib ./target/debug/libphantom_agent.so \\\n\
-          -- curl http://api.example.com/v1/users"
+          -- curl http://api.example.com/v1/users\n\
+\n\
+  # Run as a Docker Compose sidecar, tracing a container you don't spawn:\n\
+  phantom run --bind 0.0.0.0 --output jsonl --data-dir /data\n\
+  # then, in the target container:\n\
+  HTTP_PROXY=http://phantom:8080 HTTPS_PROXY=http://phantom:8080 your-app\n\
+  # trust /data/ca.pem in the target container for HTTPS. See\n\
+  # examples/docker-sidecar/."
 )]
 pub struct RunArgs {
     /// Capture backend: 'proxy' (MITM, cross-platform) or 'ldpreload' (Linux, HTTP + HTTPS).
@@ -193,6 +206,17 @@ pub struct RunArgs {
     /// TCP port the proxy listens on.
     #[arg(short, long, default_value = "8080")]
     pub port: u16,
+
+    /// IP address the proxy binds to.
+    ///
+    /// Defaults to 127.0.0.1 (localhost only, matches today's behavior).
+    /// Use 0.0.0.0 to expose the proxy to other hosts/containers — e.g. running
+    /// phantom as a Docker Compose sidecar service (`phantom`) next to a target
+    /// container configured with HTTP_PROXY=http://phantom:8080. There is no
+    /// authentication on the proxy port: only bind 0.0.0.0 on a trusted/private
+    /// network (an internal Docker network, not anything internet-facing).
+    #[arg(long, default_value = "127.0.0.1", value_name = "ADDR")]
+    pub bind: IpAddr,
 
     /// Disable TLS certificate verification for connections to backend servers.
     /// Use when tracing apps that talk to servers with self-signed certificates.

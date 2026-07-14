@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use phantom_capture::FaultConfig;
@@ -75,11 +76,12 @@ fn is_php_command(exe: &str) -> bool {
 /// until after the child exits so the file is not deleted prematurely.
 pub fn spawn_proxy_child(
     command: &[String],
+    proxy_host: IpAddr,
     proxy_port: u16,
     ca_cert_pem: Option<&str>,
 ) -> anyhow::Result<(std::process::Child, Option<TempScript>)> {
     let exe = &command[0];
-    let proxy_url = format!("http://127.0.0.1:{proxy_port}");
+    let proxy_url = format!("http://{proxy_host}:{proxy_port}");
 
     let mut temp_script: Option<TempScript> = None;
     let mut actual_args = command[1..].to_vec();
@@ -153,8 +155,8 @@ pub fn spawn_proxy_child(
         temp_script = Some(TempScript(agent_path.clone()));
 
         let jvm_opts = format!(
-            " -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={proxy_port} \
-              -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={proxy_port} \
+            " -Dhttp.proxyHost={proxy_host} -Dhttp.proxyPort={proxy_port} \
+              -Dhttps.proxyHost={proxy_host} -Dhttps.proxyPort={proxy_port} \
               -Dhttp.nonProxyHosts= -Dhttps.nonProxyHosts= \
               -javaagent:{}",
             agent_path.display()
@@ -171,18 +173,33 @@ pub fn spawn_proxy_child(
     Ok((child, temp_script))
 }
 
+/// Resolves the address phantom's own process should use to reach the proxy
+/// it just started. An unspecified bind address (0.0.0.0 / ::) always
+/// includes the loopback interface, so probing/using it directly via
+/// loopback is both correct and avoids needing a routable interface IP.
+pub fn loopback_safe(bind: IpAddr) -> IpAddr {
+    if bind.is_unspecified() {
+        match bind {
+            IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        }
+    } else {
+        bind
+    }
+}
+
 /// Poll until the proxy port is accepting connections (or timeout after 5 s).
-pub async fn wait_for_proxy(port: u16) -> anyhow::Result<()> {
+pub async fn wait_for_proxy(connect_ip: IpAddr, port: u16) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        if tokio::net::TcpStream::connect((connect_ip, port))
             .await
             .is_ok()
         {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("proxy did not become ready on port {port} within 5 s");
+            anyhow::bail!("proxy did not become ready on {connect_ip}:{port} within 5 s");
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
