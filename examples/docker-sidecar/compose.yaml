@@ -1,0 +1,62 @@
+# Minimal example: phantom running as a Docker Compose sidecar, tracing a
+# separately-managed "app" container via HTTP_PROXY/HTTPS_PROXY.
+#
+# phantom does NOT spawn or manage the app container here — it is a peer
+# service on the same Docker network. The app owns its own image/command;
+# only its HTTP_PROXY/HTTPS_PROXY env vars point at phantom, and it trusts
+# phantom's MITM CA certificate (written to /data/ca.pem, shared via the
+# `phantom-data` volume) for HTTPS.
+#
+# Usage:
+#   cd examples/docker-sidecar
+#   docker compose up --build
+#   docker compose logs -f phantom       # view captured traces (JSONL)
+#
+# See README.md for the full walkthrough, including how to adapt CA trust
+# for other languages/clients, and an explicit disclaimer that this compose
+# file was authored without a Docker daemon available to verify it against —
+# please confirm it runs end-to-end in your own environment.
+
+services:
+  phantom:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command:
+      - run
+      - --bind
+      - "0.0.0.0"
+      - --port
+      - "8080"
+      - --output
+      - jsonl
+      - --data-dir
+      - /data
+    volumes:
+      - phantom-data:/data
+    ports:
+      - "8080:8080" # optional: lets you also `curl -x http://127.0.0.1:8080 ...` from the host
+
+  app:
+    image: curlimages/curl:8.10.1
+    depends_on:
+      - phantom
+    environment:
+      HTTP_PROXY: http://phantom:8080
+      HTTPS_PROXY: http://phantom:8080
+      NO_PROXY: ""
+    volumes:
+      - phantom-data:/ca:ro # phantom writes /data/ca.pem here, shared read-only
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          curl -s -o /dev/null -w 'HTTP  %{http_code}  %{url_effective}\n' \
+            http://httpbin.org/get || true
+          curl -s -o /dev/null --cacert /ca/ca.pem -w 'HTTPS %{http_code}  %{url_effective}\n' \
+            https://httpbin.org/get || true
+          sleep 5
+        done
+
+volumes:
+  phantom-data:

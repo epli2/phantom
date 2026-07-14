@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -94,10 +95,15 @@ impl CaptureManager {
             Some(p) => p,
             None => free_port()?,
         };
+        // MCP sessions are always local (stdio-driven by an AI coding agent on
+        // the same host), so the proxy only ever binds loopback here — there
+        // is no --bind flag in this mode.
+        let bind_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let fault_config = build_fault_config(fault)?;
-        let mut backend = ProxyCaptureBackend::new(port, insecure).with_faults(fault_config);
+        let mut backend =
+            ProxyCaptureBackend::new(bind_ip, port, insecure).with_faults(fault_config);
         let mut trace_rx = backend.start().map_err(|e| anyhow::anyhow!("{e}"))?;
-        wait_for_proxy(port).await?;
+        wait_for_proxy(bind_ip, port).await?;
 
         // Pump captured traces into the store off the async executor.
         let trace_count = Arc::new(AtomicU64::new(0));
@@ -124,7 +130,7 @@ impl CaptureManager {
         let mut temp_script = None;
         if !command.is_empty() {
             let ca_cert_pem = backend.ca_cert_pem();
-            let (child, ts) = spawn_proxy_child(&command, port, ca_cert_pem.as_deref())?;
+            let (child, ts) = spawn_proxy_child(&command, bind_ip, port, ca_cert_pem.as_deref())?;
             child_pid = Some(child.id());
             temp_script = ts;
             *child_state.lock().unwrap() = ChildState::Running;

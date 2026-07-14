@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -20,6 +20,7 @@ use crate::fault::{FaultConfig, FaultRule};
 const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 pub struct ProxyCaptureBackend {
+    bind_ip: IpAddr,
     listen_port: u16,
     insecure: bool,
     fault_config: FaultConfig,
@@ -29,8 +30,9 @@ pub struct ProxyCaptureBackend {
 }
 
 impl ProxyCaptureBackend {
-    pub fn new(listen_port: u16, insecure: bool) -> Self {
+    pub fn new(bind_ip: IpAddr, listen_port: u16, insecure: bool) -> Self {
         Self {
+            bind_ip,
             listen_port,
             insecure,
             fault_config: FaultConfig::default(),
@@ -67,6 +69,7 @@ impl CaptureBackend for ProxyCaptureBackend {
             fault_config: Arc::new(self.fault_config.clone()),
         };
 
+        let bind_ip = self.bind_ip;
         let port = self.listen_port;
         let insecure = self.insecure;
         let ca_cert_pem = Arc::clone(&self.ca_cert_pem);
@@ -76,7 +79,7 @@ impl CaptureBackend for ProxyCaptureBackend {
             *ca_cert_pem.lock().unwrap() = Some(ca_cert.pem());
             let ca = RcgenAuthority::new(key_pair, ca_cert, 1000);
 
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let addr = SocketAddr::new(bind_ip, port);
             info!("Starting proxy on {addr}");
 
             if insecure {
