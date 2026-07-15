@@ -20,19 +20,23 @@ crates/
   phantom-capture/           # Hudsucker MITM proxy + LD_PRELOAD (Linux) CaptureBackend
   phantom-tui/               # Ratatui terminal UI
   phantom-agent/             # LD_PRELOAD dylib (Linux only, hooks libc send/recv)
+  phantom-java-agent/        # Java -javaagent premain (not a Cargo crate; built by build.rs via javac/jar)
 tests/
   proxy_node_integration.rs           # Integration tests: Node.js proxy capture (HTTP + HTTPS)
   proxy_php_integration.rs            # Integration test: PHP curl via proxy backend (HTTP + HTTPS)
   proxy_php_ldpreload_integration.rs  # Integration test: PHP curl via ldpreload backend (Linux only)
+  proxy_java_clients_integration.rs   # Integration test: Java HTTP clients via proxy backend (HTTP + HTTPS)
   proxy_bind_integration.rs           # Integration test: --bind 0.0.0.0 + ca.pem export (Docker sidecar mode)
   cli_query_integration.rs            # Integration tests: exit-code propagation, JSONL purity, list/get/clear, store lock UX
   mcp_stdio_integration.rs            # Integration test: MCP server via raw JSON-RPC over stdio
   apps/node-app/             # Test Node.js app (client.js, client-alts.js, proxy-preload.js)
   apps/php-app/              # Test PHP app (client.php, curl extension, PHP 5.3-compatible)
+  apps/java-http-clients/    # Test Java app (JDK HttpClient, Apache HttpClient 5; Maven project)
   integration/               # Shell-based integration tests
 examples/
   docker-sidecar/            # phantom as a Docker Compose sidecar tracing a peer container
 Cargo.toml                   # Workspace root + binary crate
+build.rs                     # Compiles crates/phantom-java-agent into phantom-java-agent.jar at build time
 plan.md                      # Japanese-language technical design document
 ```
 
@@ -103,7 +107,7 @@ make check    # fmt + clippy + build + test (full CI locally)
 | `--bind <ADDR>` | `127.0.0.1` | IP address the proxy binds to. `0.0.0.0` exposes it to other hosts/containers (Docker sidecar mode) — no auth, trusted networks only |
 | `--insecure` | off | Disable TLS verification for backend servers (self-signed certs) |
 | `--agent-lib <PATH>` | — | Path to `libphantom_agent.so` (ldpreload backend) |
-| `--fault <SPEC>` | — | Fault injection rules (repeatable) |
+| `--fault <SPEC>` | — | Fault injection rules (repeatable, proxy backend only). `delay:100ms`, `delay:100ms-500ms`, `delay:200ms:/api` (URL substring filter), `error:503`, `error:503:0.5` (probability), `error:500:0.1:/api`. Rules apply in order; delays and errors can be combined |
 | `--max-body <N>` | `0` (unlimited) | Truncate bodies in JSONL output to N bytes |
 | `--headers-only` | off | Omit bodies from JSONL output (sizes still reported) |
 | `-- <CMD>` | — | Command to spawn and trace automatically |
@@ -162,6 +166,30 @@ Unlike Node.js, PHP requires **no injected script**: libcurl (the library backin
 - `curl.cainfo` requires **PHP ≥ 5.3.7** (added in that release). On PHP 5.3.0–5.3.6, HTTP capture still works (via `HTTP_PROXY`/`HTTPS_PROXY`) but HTTPS capture fails TLS verification unless the application itself disables it.
 - If the application explicitly sets `CURLOPT_CAINFO` or `CURLOPT_SSL_VERIFYPEER`, phantom's injected `curl.cainfo` default is overridden and HTTPS capture may fail with a TLS error — the same class of limitation as Node's double-proxy guard.
 - `--backend ldpreload` (Linux only) requires **no PHP-specific code at all**: it hooks libc `send`/`recv` and OpenSSL `SSL_write`/`SSL_read` at a language-agnostic level, so it captures PHP's curl-based HTTP and HTTPS traffic (no MITM cert involved) exactly like it does for any other dynamically-linked process. See `tests/proxy_php_ldpreload_integration.rs`. This depends on the target's curl/OpenSSL actually calling those exact libc/OpenSSL symbols — some PHP builds bundle or `dlopen(RTLD_DEEPBIND)` their own libcurl/libssl, which shields them from `LD_PRELOAD` interposition; the integration test treats "child succeeded, zero traces captured" as an environment-support gap (skip) rather than a failure, since it's a property of the specific PHP build, not of phantom's PHP support code.
+
+---
+
+## Java Transparent Proxy Injection
+
+When the command after `--` is `java` or `javaw`, phantom automatically:
+
+1. Writes the embedded `phantom-java-agent.jar` (`include_bytes!`, built by `build.rs`) to a PID-scoped temp file.
+2. Appends JVM system properties and `-javaagent:<tempfile>` to `JAVA_TOOL_OPTIONS`: `-Dhttp.proxyHost`/`-Dhttp.proxyPort`/`-Dhttps.proxyHost`/`-Dhttps.proxyPort` (pointed at the phantom proxy) and `-Dhttp.nonProxyHosts=`/`-Dhttps.nonProxyHosts=` (clears any default exclusion list so local targets aren't bypassed).
+3. Any pre-existing `JAVA_TOOL_OPTIONS` in the environment is preserved and appended to, not overwritten.
+4. Deletes the temp jar after the child exits (`TempScript` RAII guard, same mechanism as Node/PHP).
+
+Unlike Node.js, Java requires no request-level monkey-patching: the injected `-javaagent` premain (`crates/phantom-java-agent/src/com/example/phantom/Agent.java`) installs a global `ProxySelector` forcing all connections through the phantom proxy, and replaces the JVM's default `SSLContext`/`HostnameVerifier` with a trust-all implementation so HTTPS via the MITM proxy doesn't fail certificate validation. Both HTTP and HTTPS are captured with zero application code changes.
+
+**`phantom-java-agent.jar` build (`build.rs`):**
+- Compiles `Agent.java` with `javac` and packages it with `jar` (`Premain-Class: com.example.phantom.Agent`) into `crates/phantom-java-agent/phantom-java-agent.jar`, rebuilt whenever the Java source changes (`cargo:rerun-if-changed`).
+- If `javac` is not found (e.g. a JDK-less CI/Docker image), `build.rs` writes an empty placeholder jar instead of failing, so the base `phantom` binary still builds. In that case `-javaagent` injection still fires but the agent does nothing — Java capture requires rebuilding with a JDK present.
+
+**Supported libraries:** JDK standard `java.net.http.HttpClient` (Java 11+), Apache HttpClient 5, OkHttp, and any client that honours the JVM's `http(s).proxyHost`/`proxyPort` system properties. Libraries with their own network stack (Netty, Jetty) are out of scope unless the application itself enables "use system proxy".
+
+**Known limitations:**
+- The agent disables JVM-wide TLS certificate verification (rather than injecting phantom's MITM CA into a truststore, as Node/PHP do via a specific CA file). This is broader than the Node/PHP approach and is intended for development/tracing use, not for tracing security-sensitive production workloads.
+- Requires JDK 11+ (for `java.net.http.HttpClient` coverage in tests) though the agent itself only needs a JVM supporting the `java.lang.instrument` premain API.
+- See `tests/proxy_java_clients_integration.rs` and `tests/apps/java-http-clients/` (Maven project) for the integration test coverage.
 
 ---
 
@@ -266,6 +294,9 @@ cargo test --test proxy_php_integration -- --nocapture
 cargo build -p phantom-agent
 cargo test --test proxy_php_ldpreload_integration -- --nocapture
 
+# Java HTTP clients proxy integration test (requires JDK 17+ and mvn in PATH)
+cargo test --test proxy_java_clients_integration -- --nocapture
+
 # --bind 0.0.0.0 + ca.pem export test (Docker sidecar mode; requires curl)
 cargo test --test proxy_bind_integration -- --nocapture
 
@@ -298,6 +329,10 @@ Both tests:
 | `tests/proxy_php_ldpreload_integration.rs` | `ldpreload` backend (Linux only): PHP curl HTTP + HTTPS via libc/OpenSSL hooks, zero PHP-specific code — 4 traces |
 
 Both auto-skip if `php` (or its curl extension) is not available. `client.php` (shared by both tests, `tests/apps/php-app/client.php`) is written in PHP 5.3-compatible syntax and takes an optional `PHANTOM_TEST_INSECURE` env var to disable curl peer verification for the ldpreload test, where there is no phantom CA to trust against the mock backend's self-signed cert.
+
+### Java Integration Test (`tests/proxy_java_clients_integration.rs`)
+
+Verifies phantom's proxy backend captures HTTP and HTTPS traffic from JVM HTTP client libraries that honour JVM system proxy properties: JDK `java.net.http.HttpClient` (built-in, Java 11+) and Apache HttpClient 5. The proxy and `-javaagent` are injected transparently via `JAVA_TOOL_OPTIONS`, mirroring the Node.js `proxy-preload.js` injection pattern — the Java test app (`tests/apps/java-http-clients/`, a Maven project) contains zero proxy configuration code. Each client adds an `x-phantom-client` request header so traces can be identified in JSONL output, the same pattern as `test_proxy_captures_alternative_http_clients`. Requires `java` (17+) and `mvn` on `PATH`; auto-skips otherwise.
 
 ### Docker Sidecar Test (`tests/proxy_bind_integration.rs`)
 
@@ -465,6 +500,8 @@ pub enum StorageError {
 | `tests/proxy_php_integration.rs` | Integration test: PHP curl HTTP/HTTPS via `proxy` backend (`-d curl.cainfo=` injection) |
 | `tests/proxy_php_ldpreload_integration.rs` | Integration test: PHP curl HTTP/HTTPS via `ldpreload` backend (Linux only) |
 | `tests/apps/php-app/client.php` | Test client: curl extension, PHP 5.3-compatible syntax; shared by both PHP tests |
+| `tests/proxy_java_clients_integration.rs` | Integration test: Java HTTP clients (JDK `HttpClient`, Apache HttpClient 5) via `proxy` backend (`JAVA_TOOL_OPTIONS` injection) |
+| `tests/apps/java-http-clients/` | Test Java app (Maven project): JDK `HttpClient` and Apache HttpClient 5 usage |
 | `tests/proxy_bind_integration.rs` | Integration test: `--bind 0.0.0.0` and `<data_dir>/ca.pem` export (Docker sidecar mode) |
 | `examples/docker-sidecar/compose.yaml` | Example: phantom as a Docker Compose sidecar tracing a peer `app` container via HTTP_PROXY |
 | `examples/docker-sidecar/README.md` | Walkthrough: sidecar pattern, `--bind` security note, per-client CA trust table |
@@ -478,10 +515,12 @@ pub enum StorageError {
 | `crates/phantom-capture/src/proxy.rs` | MITM proxy implementation (cross-platform); `bind_ip` field controls listen address; also exposes `ca_cert_pem()` for PHP `curl.cainfo` injection and Docker sidecar CA export |
 | `crates/phantom-capture/src/ldpreload.rs` | LD_PRELOAD capture backend (Linux only) |
 | `crates/phantom-agent/src/lib.rs` | LD_PRELOAD dylib: hooks libc `send`/`recv`/`close` and OpenSSL `SSL_write`/`SSL_read` (HTTPS) |
+| `crates/phantom-java-agent/src/com/example/phantom/Agent.java` | Java `-javaagent` premain: disables JVM-wide TLS verification so the MITM proxy can intercept HTTPS |
 | `crates/phantom-tui/src/app.rs` | TUI state (`App`) and all state mutation |
 | `crates/phantom-tui/src/ui.rs` | Ratatui rendering functions |
 | `crates/phantom-tui/src/lib.rs` | TUI entry point and event loop |
 | `crates/phantom-tui/src/event.rs` | `EventHandler`: crossterm key events + tick |
+| `build.rs` | Builds `crates/phantom-java-agent` into `phantom-java-agent.jar` via `javac`/`jar`; writes an empty placeholder if no JDK is present |
 | `plan.md` | Comprehensive technical design (Japanese) |
 
 ---
@@ -508,6 +547,12 @@ Node.js auto-injection (proxy mode, -- node app.js):
   → proxy-preload.js loaded by Node at startup
   → patches http.request, https.request, undici dispatcher, globalThis.fetch
   → all outbound Node requests → phantom MITM proxy
+
+Java auto-injection (proxy mode, -- java ...):
+  → runner.rs spawn_proxy_child()             # writes embedded phantom-java-agent.jar to a temp file
+  → JAVA_TOOL_OPTIONS: proxy system properties + -javaagent:<jar>
+  → Agent.java premain disables JVM-wide TLS verification
+  → JVM HTTP clients honouring system proxy properties → phantom MITM proxy
 
 LD_PRELOAD flow (Linux only):
   → phantom-agent dylib hooks send()/recv()   # intercepts plain-text HTTP/1.x
